@@ -1,0 +1,46 @@
+# Xcode / SwiftPM
+.build/
+.xcdd/
+.xcodeproj/
+.swiftpm/
+DerivedData/
+build/
+*.xcuserdatad
+*.xcuserstate
+*.xcscmblueprint
+xcuserdata/
+*.xcuserdata*
+
+# DS_Store
+**/.DS_Store
+
+# Coverage / profiling
+*.profraw
+*.profdata
+
+# Editor
+.idea/
+.vscode/
+.DS_Store
+
+# Local Claude Code config + parity-debug scripts (per-machine, not portable)
+.claude/
+
+# Per-machine env files (template lives at docs/local-runners.env.example)
+**/.env
+**/.env.local
+
+# Temp data dirs. Tests/Fixtures/ holds the parity ground-truth and is
+# committed; everything under tmp/ is scratch from runs.
+tmp/
+
+# Local benchmark / debug logs
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# uv
+.venv/

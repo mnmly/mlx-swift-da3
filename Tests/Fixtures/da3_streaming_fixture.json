@@ -1,0 +1,27 @@
+{
+  "image_dir": "da3_frames",
+  "frames": [
+    "frame_000001.png",
+    "frame_000002.png",
+    "frame_000003.png",
+    "frame_000004.png",
+    "frame_000005.png",
+    "frame_000006.png",
+    "frame_000007.png",
+    "frame_000008.png"
+  ],
+  "frame_count": 8,
+  "chunk_size": 4,
+  "overlap": 2,
+  "ref_view_strategy": "first",
+  "align_lib": "torch",
+  "use_ray_pose": true,
+  "weights": "model.safetensors",
+  "fixture_layout": {
+    "camera_poses_c2w": "[N, 4, 4] float32 \u2014 per-frame c2w pose",
+    "intrinsics_pixel": "[N, 4] float32 \u2014 fx fy cx cy per frame",
+    "sim3_s": "[P,] float32 \u2014 sim3 scale per chunk pair",
+    "sim3_R": "[P, 3, 3] float32 \u2014 sim3 rotation per chunk pair",
+    "sim3_t": "[P, 3] float32 \u2014 sim3 translation per chunk pair"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "model_dir": "0e109ae307c5982f319a67cf6f9f99ccdc0ec97c",
+  "device": "mps",
+  "height": 70,
+  "width": 98,
+  "seed": 31,
+  "keys": [
+    "input_nchw",
+    "input_nhwc",
+    "output.depth",
+    "output.depth_conf",
+    "output.extrinsics",
+    "output.intrinsics"
+  ]
+}

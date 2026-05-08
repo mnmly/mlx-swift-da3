@@ -1,0 +1,13 @@
+{
+  "n_poses": 8,
+  "radius": 3.0,
+  "rot_noise_deg": 5.0,
+  "seed": 42,
+  "max_iterations": 30,
+  "lambda_init": 1e-06,
+  "fixture_layout": {
+    "sequential_srt": "[N, 8] = [s, R(9 row-major), t(3)] per sequential transform",
+    "loop_edges": "[M, 2] int64 (i, j)",
+    "loop_srt": "[M, 8] same layout as sequential"
+  }
+}
