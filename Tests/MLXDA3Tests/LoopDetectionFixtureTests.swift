@@ -3,6 +3,7 @@ import Foundation
 import MLX
 import XCTest
 
+@testable import MLXDA3SALAD
 @testable import MLXDA3Streaming
 
 /// End-to-end parity test for SALAD loop detection.

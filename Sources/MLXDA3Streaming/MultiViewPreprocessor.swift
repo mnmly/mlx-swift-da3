@@ -1,13 +1,13 @@
 import CoreGraphics
 import Foundation
 import MLX
+import MLXDA3
 
-private let imagenetMean: [Float] = [0.485, 0.456, 0.406]
-private let imagenetStd: [Float] = [0.229, 0.224, 0.225]
-
-/// Preprocess a batch of images into a single `[1, S, H, W, 3]` MLXArray
-/// where (H, W) is determined from the first image and reused for all subsequent
-/// views. All views are forced to that resolution so they can be stacked.
+/// Batch preprocessing for multi-view inference, mirroring python `InputProcessor`.
+///
+/// Each view is resized independently (see `DA3ImagePreprocessing`); if the resulting
+/// sizes differ, all views are center-cropped to the smallest H/W exactly as python's
+/// `_unify_batch_shapes` does.
 public struct MultiViewPreprocessor {
     public let processRes: Int
     public let patchSize: Int
@@ -17,103 +17,60 @@ public struct MultiViewPreprocessor {
         self.patchSize = patchSize
     }
 
-    private func makeDivisible(_ size: Int) -> Int {
-        max((size / patchSize) * patchSize, patchSize)
+    /// Normalized model input plus the uint8 images the model actually saw.
+    public struct Batch {
+        /// `[1, S, H, W, 3]` normalized, in the requested dtype.
+        public let input: MLXArray
+        /// `[S, H, W, 3]` uint8 — python `predictions.processed_images`.
+        public let processedImages: MLXArray
+        public let height: Int
+        public let width: Int
     }
 
-    /// Compute (W, H) target rounded to patch multiples from the first image's aspect ratio.
+    /// Target (width, height) this preprocessor will produce for a given image.
     public func targetSize(for image: CGImage) -> (width: Int, height: Int) {
-        let scale = Float(processRes) / Float(max(image.width, image.height))
-        let w = makeDivisible(Int(Float(image.width) * scale))
-        let h = makeDivisible(Int(Float(image.height) * scale))
-        return (w, h)
+        DA3ImagePreprocessing.targetSize(
+            width: image.width, height: image.height,
+            processRes: processRes, patchSize: patchSize
+        )
     }
 
-    /// Render a single CGImage to a normalized RGB float32 buffer of shape (H, W, 3).
-    private func renderNormalized(_ image: CGImage, width: Int, height: Int) -> [Float] {
-        let bytesPerPixel = 4
-        let bytesPerRow = width * bytesPerPixel
-        var pixelData = [UInt8](repeating: 0, count: height * bytesPerRow)
+    /// Preprocess a batch of images.
+    public func processBatch(_ images: [CGImage], dtype: DType = .float16) -> Batch {
+        precondition(!images.isEmpty, "MultiViewPreprocessor requires at least one image")
 
-        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-              let context = CGContext(
-                  data: &pixelData,
-                  width: width,
-                  height: height,
-                  bitsPerComponent: 8,
-                  bytesPerRow: bytesPerRow,
-                  space: colorSpace,
-                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-              )
-        else {
-            fatalError("Failed to create CGContext")
+        var views = images.map {
+            DA3ImagePreprocessing.processedRGB(
+                $0, processRes: processRes, patchSize: patchSize
+            )
         }
 
-        context.interpolationQuality = .high
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-        var floatData = [Float](repeating: 0, count: height * width * 3)
-        for y in 0 ..< height {
-            for x in 0 ..< width {
-                let srcIdx = y * bytesPerRow + x * bytesPerPixel
-                let dstIdx = (y * width + x) * 3
-                for c in 0 ..< 3 {
-                    let pixel = Float(pixelData[srcIdx + c]) / 255.0
-                    floatData[dstIdx + c] = (pixel - imagenetMean[c]) / imagenetStd[c]
-                }
-            }
+        let height = views.map { $0.dim(0) }.min()!
+        let width = views.map { $0.dim(1) }.min()!
+        views = views.map { view -> MLXArray in
+            let h = view.dim(0)
+            let w = view.dim(1)
+            if h == height && w == width { return view }
+            let top = (h - height) / 2
+            let left = (w - width) / 2
+            return view[top ..< (top + height), left ..< (left + width), 0...]
         }
-        return floatData
+
+        let rgb = stacked(views, axis: 0) // [S, H, W, 3], 0...255
+        let input = DA3ImagePreprocessing.normalize(rgb)
+            .expandedDimensions(axis: 0)
+            .asType(dtype)
+        return Batch(
+            input: input,
+            processedImages: rgb.asType(.uint8),
+            height: height,
+            width: width
+        )
     }
 
-    /// Render a single CGImage to raw uint8 RGB (H, W, 3) — for "processed_images" output.
-    public func renderRGBUInt8(_ image: CGImage, width: Int, height: Int) -> [UInt8] {
-        let bytesPerPixel = 4
-        let bytesPerRow = width * bytesPerPixel
-        var pixelData = [UInt8](repeating: 0, count: height * bytesPerRow)
-
-        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-              let context = CGContext(
-                  data: &pixelData,
-                  width: width,
-                  height: height,
-                  bitsPerComponent: 8,
-                  bytesPerRow: bytesPerRow,
-                  space: colorSpace,
-                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-              )
-        else {
-            fatalError("Failed to create CGContext")
-        }
-        context.interpolationQuality = .high
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-        var rgb = [UInt8](repeating: 0, count: height * width * 3)
-        for y in 0 ..< height {
-            for x in 0 ..< width {
-                let srcIdx = y * bytesPerRow + x * bytesPerPixel
-                let dstIdx = (y * width + x) * 3
-                rgb[dstIdx] = pixelData[srcIdx]
-                rgb[dstIdx + 1] = pixelData[srcIdx + 1]
-                rgb[dstIdx + 2] = pixelData[srcIdx + 2]
-            }
-        }
-        return rgb
-    }
-
-    /// Preprocess a batch of images into `[1, S, H, W, 3]` MLXArray with the given dtype.
-    /// (H, W) is derived from the first image; all images forced to that shape.
+    /// Convenience overload for callers that only need the model input.
     public func process(_ images: [CGImage], dtype: DType = .float16) -> (input: MLXArray, height: Int, width: Int) {
-        precondition(!images.isEmpty, "MultiViewPreprocessor.process requires at least one image")
-        let (w, h) = targetSize(for: images[0])
-
-        var combined = [Float]()
-        combined.reserveCapacity(images.count * h * w * 3)
-        for img in images {
-            combined.append(contentsOf: renderNormalized(img, width: w, height: h))
-        }
-        // [S, H, W, 3] -> [1, S, H, W, 3]
-        let arr = MLXArray(combined, [images.count, h, w, 3]).expandedDimensions(axis: 0)
-        return (arr.asType(dtype), h, w)
+        let batch = processBatch(images, dtype: dtype)
+        return (batch.input, batch.height, batch.width)
     }
 }

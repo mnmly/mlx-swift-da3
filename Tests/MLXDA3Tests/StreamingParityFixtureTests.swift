@@ -30,6 +30,16 @@ import XCTest
 ///   8-frame fixture; tightening them would require either kernel-level
 ///   reduction matching or per-channel scaling at the model output.
 final class StreamingParityFixtureTests: XCTestCase {
+    static func fixtureRefViewStrategy(fixtureDir: String) -> RefViewStrategy? {
+        let url = URL(fileURLWithPath: fixtureDir)
+            .appendingPathComponent("da3_streaming_fixture.json")
+        guard let data = try? Data(contentsOf: url),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let raw = json["ref_view_strategy"] as? String
+        else { return nil }
+        return RefViewStrategy(rawValue: raw)
+    }
+
     func testStreamingPipelineParity() throws {
         let env = ProcessInfo.processInfo.environment
         let packageRoot = URL(fileURLWithPath: #filePath)
@@ -69,6 +79,9 @@ final class StreamingParityFixtureTests: XCTestCase {
         cfg.chunkSize = 4
         cfg.overlap = 2
         cfg.resolution = 504
+        // The fixture records which reference-view strategy python ran with; the Swift
+        // default is python's own default (saddle_balanced), so honour the sidecar.
+        cfg.refViewStrategy = Self.fixtureRefViewStrategy(fixtureDir: fixtureDir) ?? .saddleBalanced
         cfg.dtype = .float32  // fp32 to minimise dtype-induced drift on top of the documented fp32-vs-fp32 noise
         cfg.verbose = false
 
@@ -86,8 +99,10 @@ final class StreamingParityFixtureTests: XCTestCase {
             actual: prediction.cameraPosesC2W,
             expected: pyPoses,
             key: "camera_poses_c2w",
-            atol: 2.0,    // poses can drift several units due to backbone-driven extrinsic differences
-            meanAtol: 0.5
+            // Measured on this fixture (fp32, both sides saddle_balanced): max 0.42,
+            // mean 0.082. Headroom for fp16 runs and machine-to-machine drift.
+            atol: 1.2,
+            meanAtol: 0.25
         )
 
         // 2) intrinsics: Swift returns [N, 3, 3] but fixture stores [N, 4] (fx fy cx cy).
@@ -97,7 +112,9 @@ final class StreamingParityFixtureTests: XCTestCase {
             actual: kFlat,
             expected: pyIntr,
             key: "intrinsics_pixel",
-            atol: 400.0,    // fy on view 0 can be hundreds off (documented)
+            // Measured: focal ~13% low vs python (documented backbone drift, ~90px on
+            // this fixture); principal point within ~11px.
+            atol: 200.0,
             meanAtol: 60.0
         )
 

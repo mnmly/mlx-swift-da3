@@ -11,6 +11,9 @@ let package = Package(
     products: [
         .library(name: "MLXDA3", targets: ["MLXDA3"]),
         .library(name: "MLXDA3Streaming", targets: ["MLXDA3Streaming"]),
+        // GPL-3.0 (derived from serizba/salad) — kept in its own product so the
+        // Apache-2.0 targets can be used without it. See THIRD-PARTY-NOTICES.md.
+        .library(name: "MLXDA3SALAD", targets: ["MLXDA3SALAD"]),
         .executable(name: "da3-tool", targets: ["da3-tool"]),
         .executable(name: "da3-bench", targets: ["da3-bench"]),
         .executable(name: "da3-streaming-tool", targets: ["da3-streaming-tool"]),
@@ -28,7 +31,6 @@ let package = Package(
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ]
         ),
@@ -53,8 +55,7 @@ let package = Package(
             dependencies: [
                 "MLXDA3",
                 .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "MLXLinalg", package: "mlx-swift")
+                .product(name: "MLXNN", package: "mlx-swift")
             ]
         ),
         .executableTarget(
@@ -75,17 +76,26 @@ let package = Package(
             ],
             path: "Tools/da3-streaming-bench"
         ),
+        .target(
+            name: "MLXDA3SALAD",
+            dependencies: [
+                "MLXDA3",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift")
+            ]
+        ),
         .executableTarget(
             name: "da3-loop-tool",
             dependencies: [
                 "MLXDA3Streaming",
+                "MLXDA3SALAD",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Tools/da3-loop-tool"
         ),
         .testTarget(
             name: "MLXDA3Tests",
-            dependencies: ["MLXDA3", "MLXDA3Streaming"]
+            dependencies: ["MLXDA3", "MLXDA3Streaming", "MLXDA3SALAD"]
         )
     ]
 )

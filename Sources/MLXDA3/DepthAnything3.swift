@@ -45,42 +45,60 @@ public class DepthAnything3: Module {
 
     /// Forward pass.
     ///
-    /// - Parameter x: Input images `[B, S, H, W, C]` (NHWC) where S is number of views.
-    ///   For single image: `[1, 1, H, W, 3]`
+    /// - Parameters:
+    ///   - x: Input images `[B, S, H, W, C]` (NHWC) where S is number of views.
+    ///     For single image: `[1, 1, H, W, 3]`
+    ///   - refViewStrategy: Reference-view selection, matching python's
+    ///     `ref_view_strategy` (default `saddle_balanced`). Only affects `S >= 3`.
     /// - Returns: Dict with keys like "depth", "depth_conf", "ray", "ray_conf", "sky"
-    public func callAsFunction(_ x: MLXArray) -> [String: MLXArray] {
+    public func callAsFunction(
+        _ x: MLXArray,
+        refViewStrategy: RefViewStrategy = .saddleBalanced
+    ) -> [String: MLXArray] {
         let H = x.dim(2)
         let W = x.dim(3)
 
-        let (feats, _) = backbone(x)
+        let feats = DA3Profiler.measure("  backbone", sync: { MLX.eval($0.map { $0.0 }) }) {
+            backbone(x, refViewStrategy: refViewStrategy).0
+        }
 
-        if let dualHead = head as? DualDPT {
-            return dualHead.callAsFunction(feats: feats, H: H, W: W)
-        } else if let dptHead = head as? DPT {
-            return dptHead.callAsFunction(feats: feats, H: H, W: W)
-        } else {
-            fatalError("Unknown head type")
+        return DA3Profiler.measure("  head", sync: { MLX.eval($0) }) {
+            if let dualHead = head as? DualDPT {
+                return dualHead.callAsFunction(feats: feats, H: H, W: W)
+            } else if let dptHead = head as? DPT {
+                return dptHead.callAsFunction(feats: feats, H: H, W: W)
+            } else {
+                fatalError("Unknown head type")
+            }
         }
     }
 
-    public func callAsFunction(_ x: MLXArray, outputs requestedOutputs: DA3Outputs = .all) -> [String: MLXArray] {
+    public func callAsFunction(
+        _ x: MLXArray,
+        outputs requestedOutputs: DA3Outputs = .all,
+        refViewStrategy: RefViewStrategy = .saddleBalanced
+    ) -> [String: MLXArray] {
         if requestedOutputs == .all {
-            return callAsFunction(x)
+            return callAsFunction(x, refViewStrategy: refViewStrategy)
         }
 
         let H = x.dim(2)
         let W = x.dim(3)
 
         // Backbone: extract multi-scale features
-        let (feats, _) = backbone(x)
+        let feats = DA3Profiler.measure("  backbone", sync: { MLX.eval($0.map { $0.0 }) }) {
+            backbone(x, refViewStrategy: refViewStrategy).0
+        }
 
         // Head: decode features to depth
-        if let dualHead = head as? DualDPT {
-            return dualHead.callAsFunction(feats: feats, H: H, W: W, outputs: requestedOutputs)
-        } else if let dptHead = head as? DPT {
-            return dptHead.callAsFunction(feats: feats, H: H, W: W, outputs: requestedOutputs)
-        } else {
-            fatalError("Unknown head type")
+        return DA3Profiler.measure("  head", sync: { MLX.eval($0) }) {
+            if let dualHead = head as? DualDPT {
+                return dualHead.callAsFunction(feats: feats, H: H, W: W, outputs: requestedOutputs)
+            } else if let dptHead = head as? DPT {
+                return dptHead.callAsFunction(feats: feats, H: H, W: W, outputs: requestedOutputs)
+            } else {
+                fatalError("Unknown head type")
+            }
         }
     }
 }

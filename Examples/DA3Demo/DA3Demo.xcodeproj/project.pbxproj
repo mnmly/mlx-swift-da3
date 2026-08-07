@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		998AD8722FAE102D00F0EB38 /* MLXDA3 in Frameworks */ = {isa = PBXBuildFile; productRef = 998AD8712FAE102D00F0EB38 /* MLXDA3 */; };
 		998AD8742FAE102D00F0EB38 /* MLXDA3Streaming in Frameworks */ = {isa = PBXBuildFile; productRef = 998AD8732FAE102D00F0EB38 /* MLXDA3Streaming */; };
+		998AD8762FAE102D00F0EB38 /* MLXDA3SALAD in Frameworks */ = {isa = PBXBuildFile; productRef = 998AD8752FAE102D00F0EB38 /* MLXDA3SALAD */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -29,6 +30,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				998AD8742FAE102D00F0EB38 /* MLXDA3Streaming in Frameworks */,
+				998AD8762FAE102D00F0EB38 /* MLXDA3SALAD in Frameworks */,
 				998AD8722FAE102D00F0EB38 /* MLXDA3 in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -74,6 +76,7 @@
 			packageProductDependencies = (
 				998AD8712FAE102D00F0EB38 /* MLXDA3 */,
 				998AD8732FAE102D00F0EB38 /* MLXDA3Streaming */,
+				998AD8752FAE102D00F0EB38 /* MLXDA3SALAD */,
 			);
 			productName = DA3Demo;
 			productReference = 998AD8582FAE0F7D00F0EB38 /* DA3Demo.app */;
@@ -399,6 +402,10 @@
 		998AD8732FAE102D00F0EB38 /* MLXDA3Streaming */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = MLXDA3Streaming;
+		};
+		998AD8752FAE102D00F0EB38 /* MLXDA3SALAD */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = MLXDA3SALAD;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

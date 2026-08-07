@@ -2,10 +2,11 @@
 
 Swift port of [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3) for Apple Silicon, built on [mlx-swift](https://github.com/ml-explore/mlx-swift).
 
-Two products:
+Three products:
 
 - **`MLXDA3`** — the DA3 model (DinoV2 backbone + DPT/DualDPT head) and a `da3-tool` CLI for single-image / multi-view inference.
-- **`MLXDA3Streaming`** — port of the [DA3-Streaming](https://github.com/ByteDance-Seed/Depth-Anything-3/tree/main/da3_streaming) chunked inference pipeline (Phase 1: chunked alignment, **no loop closure**) and a `da3-streaming-tool` CLI that produces camera poses + a combined point cloud from a directory of frames.
+- **`MLXDA3Streaming`** — port of the [DA3-Streaming](https://github.com/ByteDance-Seed/Depth-Anything-3/tree/main/da3_streaming) chunked inference pipeline (chunk alignment + Sim(3) pose-graph refinement) and a `da3-streaming-tool` CLI that produces camera poses + a combined point cloud from a directory of frames.
+- **`MLXDA3SALAD`** — SALAD visual place recognition for loop detection. Kept as a separate product because it is **GPL-3.0**, unlike the Apache-2.0 rest of this repo; nothing in `MLXDA3`/`MLXDA3Streaming` depends on it. See [Licence](#licence).
 
 ## Status
 
@@ -23,8 +24,9 @@ Two products:
 | Streaming: `StreamingPipeline.predict(images:loopConstraints:)` opt-in | ✅ Phase 2 |
 | Streaming: end-to-end loop-enabled parity vs python (`LoopClosureParityFixtureTests` on 42 robot_unitree frames) | ✅ Phase 2 (plumbing parity verified; coverage of the optimizer-with-actual-loops path requires KITTI-style data not bundled in either repo) |
 | Streaming: `da3-streaming-tool` `--enable-loop-closure` CLI flag | ❌ planned (low priority — API already usable from Swift) |
-| `ref_view_strategy=saddle_balanced` | ❌ defers to backbone default |
-| Numerical parity check vs Python reference | ❌ not yet run |
+| `ref_view_strategy` (`first` / `middle` / `saddle_balanced` / `saddle_sim_range`) | ✅ parity-tested vs python selector; default `saddle_balanced` as upstream |
+| Input preprocessing (`upper_bound_resize` + cv2 INTER_AREA/INTER_CUBIC chain) | ✅ parity-tested (mean 0.05 uint8 levels vs cv2) |
+| Numerical parity check vs Python reference | ✅ per-stage fixtures; see [Tests](#tests) |
 
 See [`tasks/todo.md`](tasks/todo.md) for the full breakdown of what's done and what's still missing.
 
@@ -122,7 +124,7 @@ let depth = prediction.depth              // optional MLXArray
 ### Loop detection (SALAD VPR)
 
 ```swift
-import MLXDA3Streaming
+import MLXDA3SALAD
 
 var cfg = LoopDetector.Config()
 cfg.imageSize = (height: 336, width: 336)
@@ -162,7 +164,7 @@ import MLXDA3Streaming
 let streamingPipeline = try MLXDA3Streaming.fromPretrained(da3WeightsPath, configName: "da3-giant")
 let initialPrediction = streamingPipeline.predict(images: cgImages)
 
-// 2. Run SALAD loop detection on the same frames.
+// 2. Run SALAD loop detection on the same frames (needs `import MLXDA3SALAD`).
 let detector = try LoopDetector.fromPretrained(saladWeightsPath)
 let (_, loops) = detector.detect(images: cgImages)
 
@@ -259,8 +261,10 @@ Apple Silicon's unified memory budget is much smaller than the A100 the Python r
 --output-dir      Output directory
 --chunk-size      Frames per chunk (default: 8)
 --overlap         Overlap frames between chunks (default: 4)
---resolution      Processing resolution (default: 518)
+--resolution      Processing resolution (default: 504, matches python `process_res`)
 --dtype           float16 | float32 (default: float16)
+--ref-view-strategy  first | middle | saddle_balanced | saddle_sim_range
+                     (default: saddle_balanced, matching python)
 --limit           Cap input frame count (0 = all)
 --pcd-conf-coef   PLY conf threshold = mean(conf) * coef (default: 0.75)
 ```
@@ -276,6 +280,30 @@ Apple Silicon's unified memory budget is much smaller than the A100 the Python r
 ```
 
 Saves the depth map as raw float32 (or `.ply` for an unprojected point cloud).
+
+### Batch mode
+
+Swap `--input`/`--output` for `--input-dir`/`--output-dir` to run a whole
+directory through one model load — the right shape for per-frame monocular depth
+over a video, where re-launching the process per frame would spend more time
+mmapping weights than inferring.
+
+```bash
+ffmpeg -i input.mov -vf "scale=2072:-2" -q:v 2 /tmp/frames/frame_%06d.jpg
+
+.xcdd/Build/Products/Release/da3-tool \
+  --model da3-large \
+  --weights /path/to/model.safetensors \
+  --input-dir /tmp/frames \
+  --output-dir /tmp/depth \
+  --resolution 1036
+```
+
+Writes one raw float32 `<stem>.bin` per input frame plus a `manifest.json`
+recording `frames`, `width`, `height`, `resolution`, and `model` — so readers
+don't have to guess the map dimensions. Every frame must produce the same
+output size (the tool errors out rather than silently writing ragged maps), so
+mixed-aspect input directories are rejected.
 
 ## How the streaming pipeline works
 
@@ -293,12 +321,14 @@ Mirrors the non-loop path of Python's `DA3_Streaming.process_long_sequence`:
 | Area | Python | Swift |
 |---|---|---|
 | Camera estimation | Default: learned `cam_dec` decoder. Optional: `use_ray_pose=True` geometric path | Always geometric ray-pose (cam_dec weights skipped) |
-| Backbone ref-view selection | `saddle_balanced` for streaming | Default backbone behavior (port deferred) |
-| IRLS conf threshold heuristic | `min(median(c1), median(c2)) * 0.1` | `min(mean(c1), mean(c2)) * 0.1` (MLX has no median) |
-| SVD/QR | GPU (CUDA / Triton) | CPU stream (MLX-Swift has no GPU SVD/QR yet) |
+| Backbone ref-view selection | `saddle_balanced` when `S >= 3` | Same (`RefViewStrategy`, configurable per pipeline) |
+| Input resize | PIL decode → cv2 `INTER_AREA`/`INTER_CUBIC`, two stages | Same chain, resampled in MLX; residual ≈0.05 uint8 levels (cv2's 11-bit fixed-point weights vs float32) |
+| IRLS conf threshold heuristic | `min(median(c1), median(c2)) * 0.1` | Same (CPU-side median; MLX has no median op) |
+| SVD/QR | GPU (CUDA / Triton) | CPU stream (MLX-Swift has no GPU SVD/QR yet). The DLT solve uses QR + a 9×9 SVD instead of a full SVD of the tall matrix — same right singular vectors, ~90× faster |
+| RANSAC sampling | `np.random` (process-global) | seeded per view (`RayPose.randomSeed`) — runs are byte-reproducible |
 | Per-chunk predictions | Spilled to `.npy` between phases | Held in RAM (works for short sequences) |
 | Point-cloud subsample | Reservoir sampling at `sample_ratio<1.0` | Always `sample_ratio=1.0` (no subsample) |
-| Loop closure / SALAD detector | Implemented | Not ported (Phase 2) |
+| Loop closure / SALAD detector | Implemented | Ported in the separate `MLXDA3SALAD` target (GPL-3.0 — see [Licence](#licence)) |
 
 ## Tests
 
@@ -312,6 +342,9 @@ Two parity fixture tests live under `Tests/MLXDA3Tests/`:
 | Test | What it covers | Fixture generator |
 |---|---|---|
 | `ParityFixtureTests` | Single-image DA3 forward pass vs torch reference | `Scripts/generate_fixtures.py` |
+| `PreprocessParityTests` | Image preprocessing vs python `InputProcessor` (resize chain + normalization) | `Scripts/generate_preprocess_fixture.py` |
+| `ReferenceViewSelectionTests` | `select_reference_view` / `reorder_by_reference` / `restore_original_order` for all four strategies | `Scripts/generate_ref_view_fixture.py` |
+| `BackboneRefViewTests` | Backbone forward is permutation-equivariant with content-based ref-view selection (no weights needed) | (none — pure Swift) |
 | `StreamingParityFixtureTests` | End-to-end `StreamingPipeline` (poses + intrinsics + sim3) vs `da3_streaming.DA3_Streaming` | `Scripts/generate_streaming_parity_fixture.py` |
 | `LoopDetectionFixtureTests` | SALAD `LoopDetector` (descriptors + loop pairs) vs python `loop_utils.LoopDetector` | `Scripts/generate_loop_detection_fixture.py` |
 | `Sim3LieGroupTests` | Sim(3) Exp/Log/Compose/Inverse identities (no python dep) | (none — pure Swift) |
@@ -319,7 +352,8 @@ Two parity fixture tests live under `Tests/MLXDA3Tests/`:
 | `Sim3LoopOptimizerFixtureTests` | Sim(3) LM trajectory parity vs python `Sim3LoopOptimizer` on a noisy 8-pose ring | `Scripts/generate_sim3_loop_fixture.py` |
 | `LoopClosureParityFixtureTests` | End-to-end loop-enabled streaming (detector + measurement + optimizer + pose accumulation) vs python with `loop_enable=True` on 42 robot_unitree frames | `Scripts/generate_streaming_parity_fixture.py --enable-loop-closure` |
 
-Each test `XCTSkip`s if its fixture or weights aren't present. The fastest
+Each test `XCTSkip`s if its fixture or weights aren't present — with everything in place
+the suite is 51 tests, 0 skipped. The fastest
 way to run the suite locally is via the convenience script (which sources
 your `.claude/local-runners/.env`):
 
@@ -352,38 +386,85 @@ xcodebuild -scheme MLXDA3-Package -destination 'platform=macOS' \
   -only-testing:MLXDA3Tests/StreamingParityFixtureTests
 ```
 
-Streaming-test tolerances are deliberately loose to absorb the residual
-fp32 matmul reduction-order drift between MLX and PyTorch (documented in
-`tasks/todo.md`); the substantive porting bugs (pos-embed interpolation
-mode) are already fixed and verified to 1.5e-6 vs torch.
+### Measured agreement with the Python reference
+
+8-frame fixture, fp32 on both sides, DA3NESTED-GIANT-LARGE-1.1, both running
+`ref_view_strategy=saddle_balanced`:
+
+| Quantity | Agreement |
+|---|---|
+| Preprocessed model input | mean 0.0009, max 0.035 (normalized units) |
+| Reference-view selection | exact (index + reorder/restore to 1e-6) |
+| Camera poses (c2w) | max 0.42, mean 0.082 |
+| Principal point `cx, cy` | within 11 px |
+| Focal `fx, fy` | ~13% low — the open gap, see `tasks/todo.md` |
+
+Streaming-test tolerances sit just above these numbers so a regression fails.
+The residual focal-length error comes from backbone numerical drift (fp32 matmul
+reduction order between MLX and PyTorch compounding over 40 layers, then amplified
+by a ReLU in the DPT aux pyramid) — it is *not* preprocessing, which now matches
+cv2 to ~0.05 uint8 levels.
 
 ## Benchmarks
 
-8-frame fixture, `chunk_size=4`, `overlap=2`, 1 warmup + 3–5 measured
-iterations. Apple Silicon (M-series); see `Benchmarks/README.md` for
-exact hardware footnote when committing numbers from a fresh machine.
+**Build Release for inference** — a Debug build is several times slower and its numbers
+are meaningless.
 
-| Backend | dtype | mean_s | median_s | min_s | max_s | load_s |
-|---|---|---|---|---|---|---|
-| mlx-swift | fp16 | 2.65 | 2.65 | 2.57 | 2.71 | 0.42 |
-| torch (CPU) | fp32 | 241.54 | 241.75 | 241.00 | 241.85 | 4.24 |
+8-frame fixture, `chunk_size=4`, `overlap=2`, fp16, warmup + 5 measured iterations.
 
-Swift (mlx-swift, fp16, GPU via Metal) is **~91× faster per iteration**
-than torch on CPU for the streaming pipeline on this fixture. Apples-to-
-apples vs torch MPS isn't covered here (the python `da3_streaming`
-reference doesn't run on Metal without engineering work — pypose's
-graph-based ops have CUDA-only paths). The CPU number is what's
-realistically reproducible on a Mac without a GPU passthrough.
+| Backend | dtype | median_s | notes |
+|---|---|---|---|
+| mlx-swift | fp16 | 1.81 | this port, quiet machine |
+| torch (CPU) | fp32 | 241.75 | python reference, no Metal path |
+
+The python `da3_streaming` reference has no working Metal path (pypose's graph ops are
+CUDA-only), so CPU is what's actually reproducible on a Mac.
+
+### Where the time goes
+
+`da3-streaming-bench --profile` prints a per-phase breakdown:
+
+| phase | share |
+|---|---|
+| backbone (DINOv2-giant, 4 views × 721 tokens) | ~55% |
+| DPT head | ~25% |
+| ray → pose (RANSAC + QL) | ~8% |
+| chunk Sim(3) alignment | ~4% |
+| preprocessing, point maps, pose accumulation | <1% |
+
+The backbone runs at roughly 20 TFLOP/s fp16 — near this hardware's roofline — so the
+remaining headroom is in quantization, not in restructuring the graph.
+
+### Memory
+
+`--memory` prints MLX's counters each iteration. `active` stays flat across repeated
+in-process runs (no leak); the large `cache` number is MLX's reusable buffer pool, not
+live memory. For a long-lived process (GUI, server) bound it:
+
+| `--cache-limit-mb` | cache held | median_s |
+|---|---|---|
+| unbounded | 14.2 GB | 2.56 |
+| 6000 | 6.0 GB | 2.80 |
+| 3000 | 3.0 GB | 2.94 |
+
+(measured on a busy machine; the ratios are what matter — ~9% slower to give back 8 GB.)
+
+### Determinism
+
+RANSAC sampling is seeded (`RayPose.randomSeed`), so the same frames produce
+byte-identical poses, intrinsics, and point clouds on every run. Change the seed to draw
+a different sample.
 
 Reproduction:
 
 ```bash
-# Swift (after building da3-streaming-bench)
-.xcdd/Build/Products/release/da3-streaming-bench \
+# Swift (after building da3-streaming-bench Release)
+.xcdd/Build/Products/Release/da3-streaming-bench \
   --model da3-giant \
   --weights /path/to/model.safetensors \
   --image-dir tmp/da3_frames \
-  --chunk-size 4 --overlap 2 --limit 8 --warmup 1 --iterations 5
+  --chunk-size 4 --overlap 2 --limit 8 --warmup 1 --iterations 5 \
+  --profile --memory
 
 # Python
 KMP_DUPLICATE_LIB_OK=TRUE uv run --script Benchmarks/torch_da3_streaming_bench.py \
@@ -403,7 +484,7 @@ mlx-swift-da3/
 ├── Package.swift
 ├── Sources/
 │   ├── MLXDA3/                 # core model
-│   └── MLXDA3Streaming/        # chunked streaming pipeline
+│   ├── MLXDA3Streaming/        # chunked streaming pipeline
 │       ├── ImageDirectory.swift
 │       ├── MultiViewPreprocessor.swift
 │       ├── ChunkIndex.swift
@@ -417,12 +498,13 @@ mlx-swift-da3/
 │       ├── CameraPosesIO.swift        # camera_poses.txt + intrinsic.txt
 │       ├── StreamingOrchestrator.swift  # file-IO orchestrator (CLI uses this)
 │       ├── StreamingPipeline.swift      # high-level in-memory API
-│       └── loop/                        # Phase 2: loop closure
-│           ├── Salad.swift              # SALAD VPR model (DinoV2-B/14 + aggregator)
-│           ├── SaladWeightLoading.swift
-│           ├── LoopDetector.swift       # batching + brute-force cosine matching + NMS
-│           ├── Sim3LieGroup.swift       # Sim(3) Exp/Log/multiply/inverse (Sophus closed form)
-│           └── Sim3LoopOptimizer.swift  # LM pose-graph optimizer with numerical Jacobian
+│   │   └── loop/                        # Phase 2: loop closure
+│   │       ├── Sim3LieGroup.swift       # Sim(3) Exp/Log/multiply/inverse (Sophus closed form)
+│   │       └── Sim3LoopOptimizer.swift  # LM pose-graph optimizer with numerical Jacobian
+│   └── MLXDA3SALAD/            # GPL-3.0, isolated: SALAD place recognition
+│       ├── Salad.swift              # SALAD VPR model (DinoV2-B/14 + aggregator)
+│       ├── SaladWeightLoading.swift
+│       └── LoopDetector.swift       # batching + brute-force cosine matching + NMS
 ├── Tests/
 │   ├── Fixtures/                # parity fixtures (.safetensors + .json)
 │   └── MLXDA3Tests/
@@ -446,6 +528,18 @@ mlx-swift-da3/
 ├── tasks/todo.md               # streaming port plan + status
 └── README.md
 ```
+
+## Licence
+
+Apache-2.0 (see [`LICENSE`](LICENSE)), matching upstream Depth Anything 3 — **except**
+`Sources/MLXDA3SALAD`, which is a port of [serizba/salad](https://github.com/serizba/salad)
+and is therefore **GPL-3.0**. It lives in its own SwiftPM target/product and nothing in
+`MLXDA3` or `MLXDA3Streaming` links it: the streaming pipeline takes loop constraints as
+plain data, so you can supply them from any detector. Link `MLXDA3SALAD` only if your
+product can comply with GPL-3.0.
+
+Full attribution for every ported component is in
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md). No model weights are redistributed here.
 
 ## Acknowledgements
 

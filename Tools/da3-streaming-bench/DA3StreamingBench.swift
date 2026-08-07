@@ -45,8 +45,18 @@ struct DA3StreamingBench: ParsableCommand {
     @Flag(name: .long, help: "Include image-load (CGImage decode) in measured time.")
     var includeLoad: Bool = false
 
+    @Flag(name: .long, help: "Print a per-phase time breakdown (adds sync points; totals shift slightly).")
+    var profile: Bool = false
+
+    @Flag(name: .long, help: "Print MLX active/cache/peak memory after each iteration (leak check).")
+    var memory: Bool = false
+
+    @Option(name: .long, help: "Cap MLX's buffer cache, in MB (0 = unbounded).")
+    var cacheLimitMb: Int = 0
+
     func run() throws {
         let targetDtype: DType = dtype == "float32" ? .float32 : .float16
+        if cacheLimitMb > 0 { MLX.Memory.cacheLimit = cacheLimitMb * 1_000_000 }
 
         var paths = try ImageDirectory.listImagePaths(in: imageDir)
         if limit > 0, paths.count > limit { paths = Array(paths.prefix(limit)) }
@@ -84,11 +94,29 @@ struct DA3StreamingBench: ParsableCommand {
             _ = try runOnce()
         }
 
+        if profile {
+            DA3Profiler.isEnabled = true
+            DA3Profiler.reset()
+        }
+
         var times: [Double] = []
-        for _ in 0..<max(1, iterations) {
+        for i in 0..<max(1, iterations) {
             let start = CFAbsoluteTimeGetCurrent()
             _ = try runOnce()
             times.append(CFAbsoluteTimeGetCurrent() - start)
+            if memory {
+                print(String(
+                    format: "iter %d: active=%dMB cache=%dMB peak=%dMB",
+                    i,
+                    MLX.Memory.activeMemory / 1_000_000,
+                    MLX.Memory.cacheMemory / 1_000_000,
+                    MLX.Memory.peakMemory / 1_000_000
+                ))
+            }
+        }
+        if profile {
+            DA3Profiler.isEnabled = false
+            print(DA3Profiler.report())
         }
 
         let mean = times.reduce(0, +) / Double(times.count)

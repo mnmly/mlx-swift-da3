@@ -46,6 +46,9 @@ public struct StreamingPipeline {
         public var overlap: Int = 4
         public var resolution: Int = 504
         public var dtype: DType = .float16
+        /// Reference-view selection strategy, mirroring python `ref_view_strategy`.
+        /// Only applies to chunks with 3 or more views.
+        public var refViewStrategy: RefViewStrategy = .saddleBalanced
         public var pcdSampleRatio: Float = 1.0
         public var pcdConfThresholdCoef: Float = 0.75
         public var irls: Sim3Alignment.Config = Sim3Alignment.Config()
@@ -76,7 +79,10 @@ public struct StreamingPipeline {
         loopConstraints: [LoopConstraint] = []
     ) -> StreamingPrediction {
         let preproc = MultiViewPreprocessor(processRes: config.resolution)
-        let inference = StreamingInference(model: model, preprocessor: preproc, dtype: config.dtype)
+        let inference = StreamingInference(
+            model: model, preprocessor: preproc, dtype: config.dtype,
+            refViewStrategy: config.refViewStrategy
+        )
 
         let chunks = ChunkIndex.compute(
             numImages: images.count,
@@ -112,8 +118,12 @@ public struct StreamingPipeline {
                     sim3Pairs.append(.identity)
                     continue
                 }
-                let pmPrev = PointMaps.depthToWorldPoints(depth: prev.depth, intrinsics: prevInt, extrinsicsW2C: prevExt)
-                let pmCur = PointMaps.depthToWorldPoints(depth: cur.depth, intrinsics: curInt, extrinsicsW2C: curExt)
+                let (pmPrev, pmCur) = DA3Profiler.measure(
+                    "pointmaps", sync: { MLX.eval($0.0, $0.1) }
+                ) {
+                    (PointMaps.depthToWorldPoints(depth: prev.depth, intrinsics: prevInt, extrinsicsW2C: prevExt),
+                     PointMaps.depthToWorldPoints(depth: cur.depth, intrinsics: curInt, extrinsicsW2C: curExt))
+                }
                 eval(pmPrev, pmCur)
 
                 let O = config.overlap
@@ -122,11 +132,13 @@ public struct StreamingPipeline {
                 let confPrevTail = prev.conf[(prev.viewCount - O)..<prev.viewCount]
                 let confCurHead = cur.conf[0..<O]
 
-                let xform = ChunkAlignment.alignWeighted(
-                    pointMap1: pmPrevTail, conf1: confPrevTail,
-                    pointMap2: pmCurHead, conf2: confCurHead,
-                    irlsConfig: config.irls
-                )
+                let xform = DA3Profiler.measure("chunk.align") {
+                    ChunkAlignment.alignWeighted(
+                        pointMap1: pmPrevTail, conf1: confPrevTail,
+                        pointMap2: pmCurHead, conf2: confCurHead,
+                        irlsConfig: config.irls
+                    )
+                }
                 if config.verbose {
                     print(String(format: "  sim3 s=%.4f t=[%.3f, %.3f, %.3f]",
                                  xform.s, xform.t[0], xform.t[1], xform.t[2]))
@@ -163,7 +175,11 @@ public struct StreamingPipeline {
             overlap: config.overlap,
             totalFrames: images.count
         )
-        let poses = CameraPosesIO.computePoses(posesInputs)
+        let poses = DA3Profiler.measure(
+            "poses", sync: { MLX.eval($0.cameraPosesC2W, $0.intrinsicsK) }
+        ) {
+            CameraPosesIO.computePoses(posesInputs)
+        }
 
         return StreamingPrediction(
             cameraPosesC2W: poses.cameraPosesC2W,
@@ -212,7 +228,10 @@ public extension StreamingPipeline {
 
         // Run DA3 on the combined frames.
         let preproc = MultiViewPreprocessor(processRes: config.resolution)
-        let inference = StreamingInference(model: model, preprocessor: preproc, dtype: config.dtype)
+        let inference = StreamingInference(
+            model: model, preprocessor: preproc, dtype: config.dtype,
+            refViewStrategy: config.refViewStrategy
+        )
         let combined = framesA + framesB
         let pred = inference.predict(images: combined)
         guard let loopExt = pred.extrinsics, let loopInt = pred.intrinsics else { return nil }

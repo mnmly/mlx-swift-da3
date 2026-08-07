@@ -41,6 +41,12 @@ struct DA3StreamingTool: ParsableCommand {
     @Option(name: .long, help: "Weight dtype: float16 or float32")
     var dtype: String = "float16"
 
+    @Option(
+        name: .long,
+        help: "Reference-view strategy for chunks with 3+ views: first | middle | saddle_balanced | saddle_sim_range"
+    )
+    var refViewStrategy: String = RefViewStrategy.saddleBalanced.rawValue
+
     @Option(name: .long, help: "Limit number of images (0 = all)")
     var limit: Int = 0
 
@@ -77,6 +83,13 @@ struct DA3StreamingTool: ParsableCommand {
         cfg.chunkSize = chunkSize
         cfg.overlap = overlap
         cfg.resolution = resolution
+        guard let strategy = RefViewStrategy(rawValue: refViewStrategy) else {
+            throw ValidationError(
+                "Unknown --ref-view-strategy '\(refViewStrategy)'. Expected one of: "
+                + RefViewStrategy.allCases.map(\.rawValue).joined(separator: ", ")
+            )
+        }
+        cfg.refViewStrategy = strategy
         cfg.dtype = targetDtype
         cfg.pcdConfThresholdCoef = pcdConfCoef
         cfg.dumpDir = dumpDir

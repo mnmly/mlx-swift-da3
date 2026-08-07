@@ -11,39 +11,45 @@ public struct StreamingInference {
     public let model: DepthAnything3
     public let preprocessor: MultiViewPreprocessor
     public let dtype: DType
+    /// Mirrors python `ref_view_strategy` (default `saddle_balanced`).
+    public let refViewStrategy: RefViewStrategy
 
     public init(
         model: DepthAnything3,
         preprocessor: MultiViewPreprocessor = MultiViewPreprocessor(),
-        dtype: DType = .float16
+        dtype: DType = .float16,
+        refViewStrategy: RefViewStrategy = .saddleBalanced
     ) {
         self.model = model
         self.preprocessor = preprocessor
         self.dtype = dtype
+        self.refViewStrategy = refViewStrategy
     }
 
     /// Run inference on a chunk of images (shape `[1, S, H, W, 3]` internally).
     public func predict(images: [CGImage], outputs: DA3Outputs = .all, dumpInputPath: String? = nil, dumpBackbonePath: String? = nil) -> ChunkPredictions {
-        let (input, h, w) = preprocessor.process(images, dtype: dtype)
+        let batch = DA3Profiler.measure("preprocess", sync: { MLX.eval($0.input) }) {
+            preprocessor.processBatch(images, dtype: dtype)
+        }
+        let input = batch.input
+        let h = batch.height
+        let w = batch.width
         if let path = dumpInputPath {
             try? NpyWriter.writeFloat32(input.asType(.float32), to: path)
         }
         if let path = dumpBackbonePath {
             // Run backbone in isolation and dump last feature stage.
-            let (feats, _) = model.backbone(input)
+            let (feats, _) = model.backbone(input, refViewStrategy: refViewStrategy)
             let last = feats[feats.count - 1].0  // [B, S, N, C] patch tokens after norm
             try? NpyWriter.writeFloat32(last.asType(.float32), to: path)
         }
 
-        // Build raw uint8 processed images on CPU side (matches python predictions.processed_images)
-        var rgbBuffer = [UInt8]()
-        rgbBuffer.reserveCapacity(images.count * h * w * 3)
-        for img in images {
-            rgbBuffer.append(contentsOf: preprocessor.renderRGBUInt8(img, width: w, height: h))
-        }
-        let processed = MLXArray(rgbBuffer, [images.count, h, w, 3])
+        // Matches python predictions.processed_images.
+        let processed = batch.processedImages
 
-        let raw = model(input, outputs: outputs)
+        let raw = DA3Profiler.measure("model.forward", sync: { MLX.eval($0) }) {
+            model(input, outputs: outputs, refViewStrategy: refViewStrategy)
+        }
         eval(raw)
 
         // Squeeze leading B=1 batch axis only. Trailing channel dim handling depends on
@@ -83,10 +89,14 @@ public struct StreamingInference {
         var intrinsics: MLXArray? = nil
         var extrinsics: MLXArray? = nil
         if let r = ray, let rc = rayConf {
-            let (extW2C, intr) = RayPose.cameraInfoFromRays(
-                ray: r, rayConf: rc,
-                imageHeight: h, imageWidth: w
-            )
+            let (extW2C, intr) = DA3Profiler.measure(
+                "raypose", sync: { MLX.eval($0.0, $0.1) }
+            ) {
+                RayPose.cameraInfoFromRays(
+                    ray: r, rayConf: rc,
+                    imageHeight: h, imageWidth: w
+                )
+            }
             extrinsics = extW2C
             intrinsics = intr
         }

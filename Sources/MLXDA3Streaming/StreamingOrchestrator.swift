@@ -12,6 +12,9 @@ public struct StreamingOrchestrator {
         public var overlap: Int = 4
         public var resolution: Int = 504
         public var dtype: DType = .float16
+        /// Reference-view selection strategy, mirroring python `ref_view_strategy`.
+        /// Only applies to chunks with 3 or more views.
+        public var refViewStrategy: RefViewStrategy = .saddleBalanced
         public var pcdSampleRatio: Float = 1.0
         public var pcdConfThresholdCoef: Float = 0.75
         public var irls: Sim3Alignment.Config = Sim3Alignment.Config()
@@ -43,7 +46,10 @@ public struct StreamingOrchestrator {
         }
 
         let preproc = MultiViewPreprocessor(processRes: config.resolution)
-        let inference = StreamingInference(model: model, preprocessor: preproc, dtype: config.dtype)
+        let inference = StreamingInference(
+            model: model, preprocessor: preproc, dtype: config.dtype,
+            refViewStrategy: config.refViewStrategy
+        )
 
         // Debug dump: cameraToken values to verify weight loading.
         if let dd = config.dumpDir, let ct = model.backbone.cameraToken {

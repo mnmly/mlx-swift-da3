@@ -175,10 +175,14 @@ public class DinoVisionTransformer: Module {
     /// - Parameters:
     ///   - x: Input images `[B, S, H, W, C]` (NHWC) where S is num views
     ///   - camToken: Optional camera conditioning tokens `[B, S, D]`
+    ///   - refViewStrategy: Reference-view selection strategy. Applied only when
+    ///     `camToken` is nil and `S >= ReferenceViewSelection.viewThreshold`, matching
+    ///     python `_get_intermediate_layers_not_chunked`.
     /// - Returns: Tuple of (features at out_layers, auxiliary features)
     public func callAsFunction(
         _ x: MLXArray,
-        camToken: MLXArray? = nil
+        camToken: MLXArray? = nil,
+        refViewStrategy: RefViewStrategy = .saddleBalanced
     ) -> ([(MLXArray, MLXArray)], [MLXArray]) {
         let B = x.dim(0)
         let S = x.dim(1)
@@ -198,6 +202,12 @@ public class DinoVisionTransformer: Module {
         var output: [(MLXArray, MLXArray)] = []
         var localX = tokens
 
+        // Reference-view selection is only active for multi-view input without
+        // caller-provided camera tokens.
+        let selectsReferenceView =
+            altStart != -1 && camToken == nil && S >= ReferenceViewSelection.viewThreshold
+        var referenceIndices: MLXArray? = nil
+
         for i in 0 ..< depth {
             // Determine RoPE positions for this layer
             let gPos: MLXArray?
@@ -208,6 +218,15 @@ public class DinoVisionTransformer: Module {
             } else {
                 gPos = posNoDiff
                 lPos = pos
+            }
+
+            // Promote the reference view to index 0, one block before the camera token
+            // is injected (python: `i == self.alt_start - 1`).
+            if selectsReferenceView && i == altStart - 1 {
+                let idx = ReferenceViewSelection.select(tokens, strategy: refViewStrategy)
+                referenceIndices = idx
+                tokens = ReferenceViewSelection.reorder(tokens, referenceIndices: idx)
+                localX = ReferenceViewSelection.reorder(localX, referenceIndices: idx)
             }
 
             // Inject camera tokens at altStart
@@ -242,12 +261,15 @@ public class DinoVisionTransformer: Module {
 
             // Collect outputs at specified layers
             if outLayers.contains(i) {
-                let outX: MLXArray
+                var outX: MLXArray
                 if catToken {
                     // Concatenate local and global features along feature dim
                     outX = concatenated([localX, tokens], axis: -1)
                 } else {
                     outX = tokens
+                }
+                if let idx = referenceIndices {
+                    outX = ReferenceViewSelection.restore(outX, referenceIndices: idx)
                 }
                 // Camera token is position 0: [B, S, D] or [B, S, 2*D]
                 let camTok = outX[0..., 0..., 0]

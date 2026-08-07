@@ -8,6 +8,7 @@ This file is a runbook for the next AI agent (or human) picking up the DA3-Strea
 
 - **Phase 1 (chunked streaming, no loop closure) is complete.**
 - **Phase 2 (SALAD detector + Sim3LoopOptimizer + StreamingPipeline integration) is complete.**
+  SALAD now lives in its own GPL-3.0 target, `Sources/MLXDA3SALAD/` (`import MLXDA3SALAD`).
 - The Python reference (`Depth-Anything-3`) is required for any parity work — clone it locally and set the path in `.claude/local-runners/.env` (template at `docs/local-runners.env.example`).
 - Streaming weights: `model.safetensors` from `da3_streaming/weights/` (the nested giant+large checkpoint produced by `download_weights.sh`).
 - Single-image weights: any DA3 HuggingFace repo (`depth-anything/DA3-LARGE-1.1` etc.), downloaded via `huggingface-cli download`.
@@ -76,7 +77,10 @@ I burned time on each of these — save yourself the round trip:
 
 ### Linalg ops are CPU-only
 
-`MLX.svd`, `MLX.qr`, `MLX.inv` all crash on the GPU stream with "This op is not yet supported on the GPU." Pin them with `stream: .cpu`:
+They now live in the main `MLX` module (the `MLXLinalg` / `MLXFast` products are
+deprecated shims — don't add them back). `MLX.svd`, `MLX.qr`, `MLX.inv` all crash on
+the GPU stream with "This op is not yet supported on the GPU." Pin them with
+`stream: .cpu`:
 
 ```swift
 let (U, _, Vh) = MLX.svd(A, stream: .cpu)
@@ -145,7 +149,9 @@ If you see this, you've chained too many MLX ops on one line. Break into named l
 
 ### No `median` op
 
-The Python reference uses `np.median` for the conf threshold heuristic. MLX has no median. Current code uses `mean` as a stand-in (good enough for a soft threshold, but not faithful). If you need true median, do it CPU-side via `.asArray(Float.self)` + sort.
+MLX has no median. `ChunkAlignment.median(_:)` does it CPU-side (sort the
+already-materialized `[Float]`, average the two middle values for even counts) to match
+`np.median`. Do the same if you need another one — don't substitute `mean`.
 
 ---
 
@@ -195,6 +201,20 @@ Stars (⭐) mark files I actively referenced during the Phase-1 port.
 
 ---
 
+## Performance notes (read before optimizing)
+
+- **Profile first**: `da3-streaming-bench --profile --memory`. `DA3Profiler` is opt-in and
+  free when disabled; wrap new phases with it rather than guessing.
+- **Build Release.** Debug numbers are meaningless.
+- The backbone is roofline-bound (~20 TFLOP/s fp16). Don't go looking for graph wins there;
+  the wins were in the non-model code.
+- **Never trust a "mathematically identical" optimization** — run the parity suite. The
+  zero-weight chunk-alignment rewrite was exactly equivalent on paper and wrong in practice
+  (`0 * NaN`). The suite caught it.
+- Output is deterministic (seeded RANSAC). If a refactor makes two runs differ, that is a
+  bug, not noise — diff the PLY hash.
+- MLX's `cache` memory is not a leak; `active` is. Both are printed by `--memory`.
+
 ## Verifying your work
 
 ### Smoke test (must pass before opening a PR)
@@ -218,44 +238,42 @@ Expected:
 - `intrinsic.txt` with 8 lines (4 numbers each)
 - `pcd/combined_pcd.ply` ~13 MB, ~875k vertices
 
-### Numerical parity vs Python (NOT YET DONE)
+### Numerical parity vs Python
 
-There is no parity test against the Python reference. Adding one would catch regressions in any of the algorithmic ports. Suggested approach:
-1. Run Python `da3_streaming.py` on the same `/tmp/da3_frames/` with `align_lib=torch`, save `camera_poses.txt` + first chunk's depth/conf as `.npy`.
-2. Run Swift tool on same input.
-3. Compare poses (Frobenius norm of c2w difference < threshold) and depths (relative MSE).
-4. Add to `Tests/MLXDA3Tests/` as a fixture-based test.
-
-This is the single highest-value next task.
+Parity is fixture-based; every generator lives in `Scripts/generate_*_fixture.py` and
+every test `XCTSkip`s when its fixture/weights are absent. Existing coverage: single-image
+forward, preprocessing, reference-view selection, streaming end-to-end, SALAD detection,
+Sim(3) optimizer, loop-closed streaming. Add new stages the same way — generate from the
+*real* python module where possible so the fixture can't drift from upstream.
 
 ---
 
 ## Suggested next tasks (in priority order)
 
-### 1. Numerical parity check vs Python ⭐ high value
-Without this we don't know if the ports are correct, only that they don't crash. Steps in the Verifying section above.
+### 0. Licence boundary — do not break it
+`Sources/MLXDA3SALAD` is GPL-3.0 (ported from serizba/salad); everything else is
+Apache-2.0. `MLXDA3` and `MLXDA3Streaming` must never depend on that target — loop
+constraints cross the boundary as plain data. See `THIRD-PARTY-NOTICES.md`.
 
-### 2. `ref_view_strategy=saddle_balanced` in the backbone
-Python `vision_transformer.py:316` selects a reference view among the multi-view stack for camera-token broadcasting. The Swift `DinoVisionTransformer` has a stubbed `cam_token` comment but no ref-view logic. Likely a meaningful accuracy delta. Port this once parity tests are in place to measure the effect.
 
-### 3. Loop closure (Phase 2 — biggest single chunk)
+### 2. Loop closure (Phase 2 — biggest single chunk)
 - Port `LoopDetector` (`loop_utils/loop_detector.py` + `salad/`) — needs the `dino_salad.ckpt` weights, which is a NetVLAD-style model. This is a separate model port.
 - Port `Sim3LoopOptimizer` (`loop_utils/sim3loop.py`) — pose-graph optimization with Huber.
 - Port `loop_refinement.py`.
 - C++ `fastloop/solve.cpp` — skip; port `solve_python.py` instead.
 - Wire into `StreamingOrchestrator` behind a `--loop-closure` flag.
 
-### 4. Memory: spill predictions to disk
+### 3. Memory: spill predictions to disk
 `StreamingOrchestrator.run()` keeps every chunk's predictions in RAM. For long sequences (~50+ frames at chunk_size=8) this OOMs. Python writes per-chunk `.npy` files between phases. Mirror that — define a serialization for `ChunkPredictions` (e.g. safetensors per chunk) and stream-load during the alignment + PLY-write phases.
 
-### 5. PLY reservoir sampling
+### 4. PLY reservoir sampling
 Currently `sample_ratio=1.0` is hardcoded in `PLYWriter.saveConfidentPointCloud`. Port `optimized_vectorized_reservoir_sampling` from `sim3utils.py` for `sample_ratio<1.0`. Useful for keeping the combined PLY size bounded.
 
-### 6. ImageProcessor MLX-vectorize
-`Sources/MLXDA3/ImageProcessor.swift` does CPU per-pixel normalization in pure Swift loops — slow for large/many-frame chunks. Replace with MLX tensor ops on the raw RGB UInt8 buffer.
-
-### 7. True median for IRLS conf threshold
-Replace the `mean` stand-in in `ChunkAlignment.median()` with a CPU-side `asArray + sort` median. Will only matter once parity tests reveal whether the heuristic difference shifts results.
+### 5. Preprocessing (done — don't re-litigate)
+`Sources/MLXDA3/ImagePreprocessing.swift` mirrors python's two-stage cv2 chain
+(`upper_bound_resize` then nearest-patch-multiple) with MLX-side separable area/cubic
+resampling. `ImageProcessor` and `MultiViewPreprocessor` are wrappers over it. If you
+touch it, re-run `PreprocessParityTests`.
 
 ---
 

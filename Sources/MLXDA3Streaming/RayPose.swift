@@ -1,6 +1,6 @@
 import Foundation
 import MLX
-import MLXLinalg
+import MLXDA3
 
 /// Geometric ray → camera pose estimation, ported from
 /// `python/Depth-Anything-3/src/depth_anything_3/utils/ray_utils.py`.
@@ -22,6 +22,11 @@ public enum RayPose {
     public static let reprojThreshold: Float = 0.2
     public static let zThreshold: Float = 1e-4
     public static let maxInlierNum: Int = 8000
+
+    /// Seed for RANSAC sampling. Sampling is seeded per view, so the same frames
+    /// produce the same cameras — and therefore the same point cloud — on every run.
+    /// Change it to explore a different sampling draw.
+    public nonisolated(unsafe) static var randomSeed: UInt64 = 0x5EED_DA3_5EED
 
     // MARK: - Public entry point
 
@@ -136,7 +141,10 @@ public enum RayPose {
             let src = originXY[s]                  // (N, 2)
             let dst = targetXY[s]                  // (N, 2)
             let w = weightsMasked[s]               // (N,)
-            var H = ransacHomography(srcPts: src, dstPts: dst, weights: w)
+            var H = ransacHomography(
+                srcPts: src, dstPts: dst, weights: w,
+                seed: randomSeed &+ UInt64(s)
+            )
 
             // Sign flip if det < 0 (per python).
             let detH = det3x3(H)
@@ -171,7 +179,9 @@ public enum RayPose {
             [3, 3]
         )
         let aTilde = A.matmul(P)
-        let (qTilde, rTilde) = MLX.qr(aTilde, stream: .cpu)
+        let (qTilde, rTilde) = DA3Profiler.measure("  raypose.qr", sync: { MLX.eval($0.0, $0.1) }) {
+            MLX.qr(aTilde, stream: .cpu)
+        }
         var Q = qTilde.matmul(P)
         var L = P.matmul(rTilde).matmul(P)
 
@@ -194,19 +204,22 @@ public enum RayPose {
     static func ransacHomography(
         srcPts: MLXArray,    // (N, 2)
         dstPts: MLXArray,    // (N, 2)
-        weights: MLXArray    // (N,)
+        weights: MLXArray,   // (N,)
+        seed: UInt64
     ) -> MLXArray {
         let N = srcPts.dim(0)
         precondition(N >= 4, "Need at least 4 points")
 
         let nSample = max(numSampleForRansac, Int(Float(N) * sampleRatio))
-        let weightsCPU: [Float] = weights.asArray(Float.self)
+        let weightsCPU: [Float] = DA3Profiler.measure("  raypose.pull.weights") {
+            weights.asArray(Float.self)
+        }
 
         // Top-K candidate indices by weight (descending).
         let candidate: [Int] = topKDescending(weightsCPU, k: min(nSample, N))
 
         // Generate `nIter` random samples of size `numSampleForRansac` from candidate.
-        var rng = SystemRandomNumberGenerator()
+        var rng = SplitMix64(seed: seed)
         var sampleIdx = [[Int]]()
         sampleIdx.reserveCapacity(nIter)
         for _ in 0..<nIter {
@@ -214,8 +227,9 @@ public enum RayPose {
         }
 
         // Build batch of Hs: gather sampled src/dst/w into (nIter, k, 2) etc.
-        let srcCPU: [Float] = srcPts.asArray(Float.self)
-        let dstCPU: [Float] = dstPts.asArray(Float.self)
+        let (srcCPU, dstCPU): ([Float], [Float]) = DA3Profiler.measure("  raypose.pull.pts") {
+            (srcPts.asArray(Float.self), dstPts.asArray(Float.self))
+        }
         let k = numSampleForRansac
         var srcBatch = [Float](repeating: 0, count: nIter * k * 2)
         var dstBatch = [Float](repeating: 0, count: nIter * k * 2)
@@ -250,8 +264,10 @@ public enum RayPose {
         let weightsExp = MLX.broadcast(weights.expandedDimensions(axis: 0), to: [nIter, N])
         let score = (inlier * weightsExp).sum(axis: 1)                           // (nIter,)
 
-        eval(score, inlier)
-        let scoreCPU: [Float] = score.asArray(Float.self)
+        let scoreCPU: [Float] = DA3Profiler.measure("  raypose.score", sync: { _ in }) {
+            eval(score, inlier)
+            return score.asArray(Float.self)
+        }
         var bestI = 0
         var bestS: Float = -1
         for i in 0..<nIter {
@@ -259,7 +275,9 @@ public enum RayPose {
         }
 
         // Refit using inliers of best iteration. Cap inlier count at maxInlierNum.
-        let inlierMaskCPU: [Float] = inlier[bestI].asArray(Float.self)
+        let inlierMaskCPU: [Float] = DA3Profiler.measure("  raypose.pull.inliers") {
+            inlier[bestI].asArray(Float.self)
+        }
         var inlierIdx = [Int]()
         inlierIdx.reserveCapacity(N)
         for i in 0..<N where inlierMaskCPU[i] > 0.5 { inlierIdx.append(i) }
@@ -269,7 +287,7 @@ public enum RayPose {
         }
         if inlierIdx.count > maxInlierNum {
             // Random downsample
-            inlierIdx.shuffle()
+            inlierIdx.shuffle(using: &rng)
             inlierIdx = Array(inlierIdx.prefix(maxInlierNum))
         }
         var inlierSrc = [Float](repeating: 0, count: inlierIdx.count * 2)
@@ -310,7 +328,9 @@ public enum RayPose {
         ], axis: 1)
         let A = MLX.concatenated([A1, A2], axis: 0)            // (2N, 9)
 
-        let (_, _, Vh) = MLX.svd(A, stream: .cpu)                            // Vh: (9, 9)
+        let Vh = DA3Profiler.measure("  raypose.svd.single", sync: { MLX.eval($0) }) {
+            rightSingularVectors(A)
+        }
         var H = Vh[8].reshaped([3, 3])
         H = H / H[2, 2]
         return H
@@ -337,7 +357,9 @@ public enum RayPose {
         ], axis: 2)
         let A = MLX.concatenated([A1, A2], axis: 1)            // (B, 2N, 9)
 
-        let (_, _, Vh) = MLX.svd(A, stream: .cpu)                            // (B, 9, 9)
+        let Vh = DA3Profiler.measure("  raypose.svd.batch", sync: { MLX.eval($0) }) {
+            rightSingularVectors(A)
+        }
         var H = Vh[0..., 8, 0...].reshaped([B, 3, 3])
         let H22 = H[0..., 2..<3, 2..<3]                        // (B, 1, 1)
         H = H / H22
@@ -403,12 +425,40 @@ public enum RayPose {
 
     // MARK: - Helpers
 
+    /// Right singular vectors (`Vᵀ`, shape `[..., n, n]`) of a tall matrix `[..., m, n]`.
+    ///
+    /// The DLT solve only needs `Vᵀ`, never `U`. LAPACK's `gesdd` — what MLX calls —
+    /// materializes the full `m × m` `U`, which for the refit system (m ≈ 2·720, n = 9)
+    /// costs two orders of magnitude more than the answer is worth.
+    ///
+    /// `A = QR` with orthonormal `Q` gives `AᵀA = RᵀR`, so `A` and the small `n × n` `R`
+    /// have identical right singular vectors. MLX's `qr` is the reduced form (`Q` is
+    /// `m × min(m, n)`), so this is exact, not an approximation — and unlike forming
+    /// `AᵀA` directly it does not square the condition number.
+    static func rightSingularVectors(_ A: MLXArray) -> MLXArray {
+        let (_, R) = MLX.qr(A, stream: .cpu)
+        return MLX.svd(R, stream: .cpu).2
+    }
+
     /// Determinant of a 3×3 MLXArray.
     private static func det3x3(_ A: MLXArray) -> MLXArray {
         let a = A[0, 0], b = A[0, 1], c = A[0, 2]
         let d = A[1, 0], e = A[1, 1], f = A[1, 2]
         let g = A[2, 0], h = A[2, 1], i = A[2, 2]
         return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    }
+
+    /// Reproducible RNG (Vigna's SplitMix64) so RANSAC draws are stable across runs.
+    struct SplitMix64: RandomNumberGenerator {
+        private var state: UInt64
+        init(seed: UInt64) { self.state = seed }
+        mutating func next() -> UInt64 {
+            state &+= 0x9E37_79B9_7F4A_7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+            z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+            return z ^ (z >> 31)
+        }
     }
 
     private static func topKDescending(_ values: [Float], k: Int) -> [Int] {
@@ -418,7 +468,7 @@ public enum RayPose {
     }
 
     private static func randomChoice(
-        _ pool: [Int], k: Int, rng: inout SystemRandomNumberGenerator
+        _ pool: [Int], k: Int, rng: inout SplitMix64
     ) -> [Int] {
         precondition(pool.count >= k)
         var copy = pool

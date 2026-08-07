@@ -4,6 +4,7 @@ import MLX
 import XCTest
 
 @testable import MLXDA3
+@testable import MLXDA3SALAD
 @testable import MLXDA3Streaming
 
 /// End-to-end parity test for the loop-closure-enabled streaming path.

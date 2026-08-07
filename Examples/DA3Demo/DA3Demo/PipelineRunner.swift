@@ -4,6 +4,7 @@ import Foundation
 import ImageIO
 import MLX
 import MLXDA3
+import MLXDA3SALAD
 import MLXDA3Streaming
 import SwiftUI
 

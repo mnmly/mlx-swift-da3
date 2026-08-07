@@ -2,6 +2,7 @@ import ArgumentParser
 import CoreGraphics
 import Foundation
 import MLX
+import MLXDA3SALAD
 import MLXDA3Streaming
 
 @main

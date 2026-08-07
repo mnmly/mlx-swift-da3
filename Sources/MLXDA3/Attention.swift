@@ -1,5 +1,4 @@
 import MLX
-import MLXFast
 import MLXNN
 
 public class DA3Attention: Module {
@@ -69,7 +68,7 @@ public class DA3Attention: Module {
         }
 
         // Scaled dot-product attention
-        let out = MLXFast.scaledDotProductAttention(
+        let out = scaledDotProductAttention(
             queries: q, keys: k, values: v,
             scale: scale, mask: attnMask
         )

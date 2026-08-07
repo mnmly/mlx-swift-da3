@@ -13,7 +13,7 @@
   "frame_count": 8,
   "chunk_size": 4,
   "overlap": 2,
-  "ref_view_strategy": "first",
+  "ref_view_strategy": "saddle_balanced",
   "align_lib": "torch",
   "use_ray_pose": true,
   "weights": "model.safetensors",

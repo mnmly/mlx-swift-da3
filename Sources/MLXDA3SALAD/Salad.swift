@@ -1,7 +1,6 @@
 import Foundation
 import MLX
 import MLXDA3
-import MLXFast
 import MLXNN
 
 // SALAD VPR model — vanilla DinoV2-B/14 backbone + SALAD aggregator
@@ -125,7 +124,7 @@ final class SaladAttention: Module {
         let q = qkvOut[0]
         let k = qkvOut[1]
         let v = qkvOut[2]
-        let out = MLXFast.scaledDotProductAttention(
+        let out = scaledDotProductAttention(
             queries: q, keys: k, values: v, scale: scale, mask: nil
         )
         return proj(out.transposed(axes: [0, 2, 1, 3]).reshaped([b, n, d]))
