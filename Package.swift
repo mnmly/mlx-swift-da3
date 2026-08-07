@@ -18,7 +18,8 @@ let package = Package(
         .executable(name: "da3-bench", targets: ["da3-bench"]),
         .executable(name: "da3-streaming-tool", targets: ["da3-streaming-tool"]),
         .executable(name: "da3-streaming-bench", targets: ["da3-streaming-bench"]),
-        .executable(name: "da3-loop-tool", targets: ["da3-loop-tool"])
+        .executable(name: "da3-loop-tool", targets: ["da3-loop-tool"]),
+        .executable(name: "da3-video", targets: ["da3-video"])
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", branch: "main"),
@@ -83,6 +84,14 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift")
             ]
+        ),
+        .executableTarget(
+            name: "da3-video",
+            dependencies: [
+                "MLXDA3",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Tools/da3-video"
         ),
         .executableTarget(
             name: "da3-loop-tool",

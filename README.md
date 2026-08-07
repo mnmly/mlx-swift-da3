@@ -269,6 +269,42 @@ Apple Silicon's unified memory budget is much smaller than the A100 the Python r
 --pcd-conf-coef   PLY conf threshold = mean(conf) * coef (default: 0.75)
 ```
 
+## da3-video — locked-off footage to an RGBD video
+
+For video whose camera never moves — a locked-off plate, an animated still — the
+useful pipeline is not the streaming one. There is no parallax for multi-view
+attention to exploit, and per-frame pose estimation only injects jitter into a scene
+that cannot have moved.
+
+`da3-video --static-camera` instead estimates the geometry **once**: sample frames
+across the clip, take the per-pixel median of inverse depth (the model's frame-to-frame
+variation on static geometry is pure noise — measured at 18.7% per-pixel spread and
+30.2% global scale drift on a 25 s 4K clip, which reads as the whole point cloud
+breathing), guided-upsample it to source resolution, and stack it under every colour
+frame.
+
+```bash
+.xcdd/Build/Products/Release/da3-video \
+  --input clip.mov --output clip.rgbd.mp4 \
+  --model da3-large --weights /path/to/model.safetensors \
+  --resolution 2072 --static-camera --samples 51 \
+  --near-percentile 99.5 --far-percentile 0.5
+```
+
+Output is one HEVC file at twice the source height — colour on top, inverse depth
+normalized to 0...1 below — plus a `<clip>.stereodepth.json` sidecar describing the
+mapping. A 752-frame 4K clip takes ~90 s end to end.
+
+Knobs worth knowing:
+
+| flag | why |
+|---|---|
+| `--resolution` | see the table under [Benchmarks](#benchmarks): 2072 is the practical ceiling, past which the ViT's geometry degrades |
+| `--near-percentile` | inverse depth mapped to white. Lower it (90, 80) to spend more of the 8-bit band on the mid-field instead of the nearest surface |
+| `--guide-epsilon` | guided-filter regularization in normalized units. 1e-3 keeps edges crisp; too small transfers the *texture* of the guide into depth |
+| `--no-guide` | plain resize instead of the edge-aware upsample |
+| `--samples` | frames medianed. More is smoother and costs one forward pass each |
+
 ## da3-tool — single-image / multi-view
 
 ```bash
@@ -434,6 +470,25 @@ CUDA-only), so CPU is what's actually reproducible on a Mac.
 
 The backbone runs at roughly 20 TFLOP/s fp16 — near this hardware's roofline — so the
 remaining headroom is in quantization, not in restructuring the graph.
+
+### Process resolution has a ceiling
+
+DINOv2 was trained around 518 px (~1.4k patches). Raising `--resolution` buys real
+detail up to a point, then the position-embedding extrapolation and attention
+statistics go far enough out of distribution that geometry collapses — the depth
+range compresses toward a single plane. Measured on a 4K painting, one frame:
+
+| `--resolution` | patches | depth range | structure vs 1036 | verdict |
+|---|---|---|---|---|
+| 1036 | 3.0k | 0.082 – 2.878 | 1.000 | clean, soft detail |
+| **2072** | 12.3k | 0.162 – 2.155 | 0.984 | **best** — more detail, structure intact |
+| 2380 | 16.4k | 0.346 – 1.706 | 0.949 | drifting |
+| 2912 | 24.3k | 0.533 – 1.257 | 0.905 | blobs |
+| 3836 (4K) | 42.2k | 0.359 – 1.367 | 0.749 | broken |
+
+4K runs without OOM (13 s/frame, 1.3 GB) — it is the *output* that is unusable, not the
+compute. For a 4K deliverable, run at 2072 and upsample the depth with `da3-video`'s
+guided filter, which takes its edges from the full-resolution colour.
 
 ### Memory
 

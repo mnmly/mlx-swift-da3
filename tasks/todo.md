@@ -783,3 +783,49 @@ Worth setting in the demo app / any long-lived host.
   worth the invasiveness.
 - Narrowing `DA3Outputs` for the streaming path: the head already skips unrequested
   branches, and streaming genuinely uses depth/conf/ray/ray_conf.
+
+
+---
+
+## 2026-08-07 — locked-off camera support (`da3-video`)
+
+Driven by a real clip: a 25 s 4K ProRes animated painting, camera locked, destined for
+a point-cloud sketch that consumes a colour-over-disparity video plus a sidecar.
+
+### Why the streaming pipeline is the wrong tool here
+
+No parallax, so multi-view attention has no baseline to exploit; and the ray-pose
+RANSAC re-estimates R/t/fx/fy per frame for a camera that provably did not move, while
+the chunk Sim(3) chain accumulates scale error. Measured on the clip: 18.7% per-pixel
+spread and 30.2% global scale drift across the sequence — the whole cloud breathing.
+
+### What was added
+
+- `StaticSceneDepth` (library): per-pixel temporal median of inverse depth, relative
+  spread, percentile normalization. The median is on 1/Z because that is what stereo
+  disparity is linear in, and it compresses the far field where the model is least sure.
+- `GuidedFilter` (library): fast guided filter (He et al.) for edge-aware upsampling —
+  coefficients solved at the map's resolution, only the smooth `a`/`b` fields upsampled.
+  Adds a `.bilinear` case to the resampler for those fields (cubic overshoots).
+- `da3-video` (tool): AVFoundation read/write. Samples frames, medians, guided-upsamples,
+  and writes an HEVC file at twice source height with a `.stereodepth.json` sidecar.
+- 10 tests: box-mean exactness at edges, affine recovery, edge transfer, median outlier
+  rejection, percentile clipping behaviour.
+
+### Two things the empirical check caught
+
+1. **Guided filter must run on normalized data.** `epsilon` is a contrast threshold in
+   the units of the input; running it on raw inverse depth (0.5…4.7) against a 0…1 guide
+   makes epsilon effectively zero, and the filter transfers the guide's *brush texture*
+   into the depth band. Normalizing first fixed it. A/B on a mast crop: eps 1e-3 gives
+   +20% edge energy over a plain resize with no visible texture leak; 1e-2 is
+   indistinguishable from no guide at all.
+2. **Process resolution has a hard ceiling.** 4K runs fine (13 s/frame, 1.3 GB, no OOM)
+   but the output is garbage — depth range collapses 2.88 → 1.37 and structure
+   decorrelates to 0.749. 2072 is the practical maximum; it beats the 1036 that was in
+   use, resolving rigging and boat hulls that 1036 renders as blobs.
+
+### Result
+
+752-frame 4K clip: 88 s end to end (54 sampled forwards at 0.8 fps, then decode +
+compose + HEVC encode of 3840×4320).

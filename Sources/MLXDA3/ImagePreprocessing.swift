@@ -23,6 +23,9 @@ public enum DA3ImagePreprocessing {
         case area
         /// `cv2.INTER_CUBIC` — Catmull-Rom-style bicubic, a = -0.75, replicated border.
         case cubic
+        /// Triangle/tent weights. Not part of the python chain — used when upsampling
+        /// smooth fields (guided-filter coefficients), where cubic would overshoot.
+        case bilinear
     }
 
     // MARK: - Target size
@@ -52,7 +55,7 @@ public enum DA3ImagePreprocessing {
 
     // MARK: - Resampling
 
-    /// Resize `[H, W, C]` float32 (values in 0...255) with a separable filter.
+    /// Resize `[H, W, C]` with a separable filter. Values are not clamped.
     public static func resize(
         _ image: MLXArray, height dstH: Int, width dstW: Int, method: Interpolation
     ) -> MLXArray {
@@ -81,21 +84,24 @@ public enum DA3ImagePreprocessing {
     private struct WeightKey: Hashable {
         let src: Int
         let dst: Int
-        let area: Bool
+        let method: Interpolation
     }
 
     private static let weightCacheLock = NSLock()
     private static var weightCache: [WeightKey: MLXArray] = [:]
 
     private static func weightMatrix(src: Int, dst: Int, method: Interpolation) -> MLXArray {
-        let key = WeightKey(src: src, dst: dst, area: method == .area)
+        let key = WeightKey(src: src, dst: dst, method: method)
         weightCacheLock.lock()
         defer { weightCacheLock.unlock() }
         if let cached = weightCache[key] { return cached }
 
-        let values: [Float] = method == .area
-            ? areaWeights(src: src, dst: dst)
-            : cubicWeights(src: src, dst: dst)
+        let values: [Float]
+        switch method {
+        case .area: values = areaWeights(src: src, dst: dst)
+        case .cubic: values = cubicWeights(src: src, dst: dst)
+        case .bilinear: values = bilinearWeights(src: src, dst: dst)
+        }
         let matrix = MLXArray(values, [dst, src])
         eval(matrix)
         // Bound the cache: a session sees a handful of distinct sizes, but a long-lived
@@ -125,6 +131,22 @@ public enum DA3ImagePreprocessing {
             }
             if sum > 0 {
                 for j in 0 ..< src where w[d * src + j] != 0 { w[d * src + j] /= sum }
+            }
+        }
+        return w
+    }
+
+    /// `[dst, src]` triangle taps, half-pixel centred, border replicated.
+    private static func bilinearWeights(src: Int, dst: Int) -> [Float] {
+        let scale = Double(src) / Double(dst)
+        var w = [Float](repeating: 0, count: dst * src)
+        for d in 0 ..< dst {
+            let fx = (Double(d) + 0.5) * scale - 0.5
+            let base = Int(fx.rounded(.down))
+            let t = fx - Double(base)
+            for (k, weight) in [(0, 1 - t), (1, t)] where weight != 0 {
+                let idx = min(max(base + k, 0), src - 1)
+                w[d * src + idx] += Float(weight)
             }
         }
         return w
