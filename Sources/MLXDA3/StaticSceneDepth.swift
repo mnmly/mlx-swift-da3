@@ -92,4 +92,56 @@ public enum StaticSceneDepth {
     public static func inverseDepth(_ depth: MLXArray, floor: Float = 1e-6) -> MLXArray {
         1.0 / MLX.maximum(depth, floor)
     }
+
+    /// Reconcile one frame's depth with the clip's static geometry.
+    ///
+    /// A locked-off camera gives two facts that pull in opposite directions: the
+    /// background cannot move (so per-frame estimates of it are noise, and the median
+    /// is the better answer), while anything that *does* move needs its own depth (so
+    /// the median is wrong exactly there). This keeps both.
+    ///
+    /// 1. **Scale-align.** The model's depth is only defined up to scale, and that
+    ///    scale wanders frame to frame — measured at 30% across one clip, which reads
+    ///    as the whole scene surging toward the viewer. A robust global ratio against
+    ///    the static map removes it; the correction is small (0.99…1.02) precisely
+    ///    because the geometry is genuinely fixed.
+    /// 2. **Blend by disagreement.** Where the aligned frame agrees with the static
+    ///    map, take the static map — that is the background, and it should not
+    ///    shimmer. Where it disagrees, something moved: take the frame.
+    ///
+    /// - Parameters:
+    ///   - frame: this frame's inverse depth, `[H, W]`.
+    ///   - staticMap: the clip's median inverse depth, same shape.
+    ///   - agreeBelow: relative residual under which the static map is used outright.
+    ///   - disagreeAbove: relative residual over which the frame is used outright.
+    ///     Between the two the mix ramps smoothly, so a moving edge does not pop.
+    public static func reconcile(
+        frame: MLXArray,
+        staticMap: MLXArray,
+        agreeBelow: Float = 0.05,
+        disagreeAbove: Float = 0.20
+    ) -> (map: MLXArray, scale: Float, movingFraction: Float) {
+        let safeStatic = MLX.maximum(abs(staticMap), 1e-6)
+        let scaleValue = median(frame / safeStatic)
+        let aligned = frame / max(scaleValue, 1e-6)
+
+        let residual = abs(aligned - staticMap) / safeStatic
+        let span = max(disagreeAbove - agreeBelow, 1e-6)
+        let t = clip((residual - agreeBelow) / span, min: 0, max: 1)
+        // Smoothstep, so the handover between the two estimates has no visible seam.
+        let weight = t * t * (3.0 - 2.0 * t)
+
+        let moving = (residual .> disagreeAbove).asType(.float32).mean()
+        eval(moving)
+        return (
+            map: staticMap * (1.0 - weight) + aligned * weight,
+            scale: scaleValue,
+            movingFraction: moving.item(Float.self)
+        )
+    }
+
+    /// Median of every element (used for the robust frame-to-clip scale ratio).
+    static func median(_ x: MLXArray) -> Float {
+        percentile(x, 0.5)
+    }
 }

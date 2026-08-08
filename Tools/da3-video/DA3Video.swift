@@ -1,6 +1,7 @@
 import ArgumentParser
 import AVFoundation
 import CoreGraphics
+import CoreImage
 import CoreVideo
 import Foundation
 import ImageIO
@@ -74,6 +75,18 @@ struct DA3Video: ParsableCommand {
 
     @Flag(name: .long, help: "With --static-camera: write the depth map as a single 16-bit PNG instead of a video, and leave the colour clip untouched.")
     var depthImage: Bool = false
+
+    @Flag(name: .long, help: "Per-frame depth, stabilized against the static map: background stays locked, moving subjects get their own depth. Writes a 10-bit depth movie.")
+    var depthSequence: Bool = false
+
+    @Option(name: .long, help: "With --depth-sequence: infer every Nth frame and hold in between. Depth drifts slowly, so 2-3 is usually indistinguishable and proportionally faster.")
+    var depthStride: Int = 1
+
+    @Option(name: .long, help: "Relative disagreement with the static map below which the static map is kept outright.")
+    var agreeBelow: Float = 0.05
+
+    @Option(name: .long, help: "Relative disagreement above which the frame's own depth is used outright.")
+    var disagreeAbove: Float = 0.20
 
     @Option(name: .long, help: "Stop after N source frames (0 = all).")
     var frames: Int = 0
@@ -173,9 +186,15 @@ struct DA3Video: ParsableCommand {
         }
         eval(band)
 
-        // ---- 4. write the depth, either as a still or under the colour ---------
+        // ---- 4. write the depth, as a sequence, a still, or under the colour ----
         let depthOutput: String
-        if depthImage {
+        if depthSequence {
+            depthOutput = try writeDepthSequence(
+                source: source, frameCount: frameCount, model: da3, dtype: targetDtype,
+                processor: processor, staticMap: normalized.map, rawStatic: median,
+                near: normalized.near, far: normalized.far, outputURL: outputURL
+            )
+        } else if depthImage {
             // With a locked-off camera the band is the same in every frame, so a video
             // of it is 752 copies of one image, quantized to 8 bits and put through
             // chroma subsampling and a lossy codec for no reason. A single 16-bit PNG is
@@ -208,11 +227,15 @@ struct DA3Video: ParsableCommand {
             "source": inputURL.lastPathComponent,
             // `video` is what the consumer samples: the stacked clip, or — for a depth
             // still — the untouched source, with the depth in `depthImage`.
-            "video": depthImage ? inputURL.lastPathComponent : outputURL.lastPathComponent,
+            "video": (depthImage || depthSequence)
+                ? inputURL.lastPathComponent : outputURL.lastPathComponent,
             "depthImage": depthImage ? depthOutput : "",
+            "depthVideo": depthSequence ? depthOutput : "",
+            "depthVideoBits": depthSequence ? 10 : 0,
             "bandGamma": depthImage ? 1.0 : Double(bandGamma),
-            "bandBits": depthImage ? 16 : 8,
-            "layout": depthImage ? "colour-plus-depth-still" : "colour-over-disparity",
+            "bandBits": depthImage ? 16 : (depthSequence ? 10 : 8),
+            "layout": depthImage ? "colour-plus-depth-still"
+                : (depthSequence ? "colour-plus-depth-movie" : "colour-over-disparity"),
             "width": source.width,
             "height": source.height,
             "eyeWidth": source.width,
@@ -228,7 +251,7 @@ struct DA3Video: ParsableCommand {
             "inverseDepthFar": Double(normalized.far),
             "nearPercentile": Double(nearPercentile),
             "farPercentile": Double(farPercentile),
-            "staticCamera": true,
+            "staticCamera": !depthSequence,
             "staticSamples": sampleIndices.count,
             "guided": !noGuide,
         ]
@@ -241,6 +264,97 @@ struct DA3Video: ParsableCommand {
         )
         try json.write(to: sidecarURL)
         print("Sidecar -> \(sidecarURL.lastPathComponent)")
+    }
+
+    // MARK: - Per-frame depth, stabilized against the static map
+
+    /// Walk every frame: infer its depth, reconcile it with the clip's static
+    /// geometry, upsample it guided by that frame's own colour, and write it to a
+    /// 10-bit depth movie.
+    private func writeDepthSequence(
+        source: VideoSource, frameCount: Int, model da3: DepthAnything3, dtype: DType,
+        processor: ImageProcessor, staticMap: MLXArray, rawStatic: MLXArray,
+        near: Float, far: Float, outputURL: URL
+    ) throws -> String {
+        let depthURL = outputURL
+            .deletingPathExtension().deletingPathExtension()
+            .appendingPathExtension("depth.mov")
+        let writer = try DepthVideoWriter(
+            url: depthURL, width: source.width, height: source.height,
+            fps: source.fps, bitrate: bitrateMbps * 1_000_000
+        )
+        print("Per-frame depth -> \(depthURL.lastPathComponent) "
+              + "(10-bit, stride \(depthStride), agree \(agreeBelow)…\(disagreeAbove))")
+
+        let context = CIContext(options: [.useSoftwareRenderer: false])
+        let span = max(near - far, 1e-6)
+        var held: MLXArray? = nil            // last inferred low-res map, for stride > 1
+        var scales: [Float] = []
+        var movingFractions: [Float] = []
+        let started = CFAbsoluteTimeGetCurrent()
+
+        try source.forEachFrame(limit: frameCount) { index, pixelBuffer in
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+            guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+                throw VideoError("could not convert frame \(index)")
+            }
+
+            if index % depthStride == 0 || held == nil {
+                let batch = processor(cgImage).expandedDimensions(axis: 1).asType(dtype)
+                guard let depth = da3(batch)["depth"] else {
+                    throw VideoError("model produced no depth at frame \(index)")
+                }
+                held = StaticSceneDepth.inverseDepth(depth.asType(.float32).squeezed())
+            }
+
+            let reconciled = StaticSceneDepth.reconcile(
+                frame: held!, staticMap: rawStatic,
+                agreeBelow: agreeBelow, disagreeAbove: disagreeAbove
+            )
+            scales.append(reconciled.scale)
+            movingFractions.append(reconciled.movingFraction)
+
+            // One global mapping for the whole clip — a per-frame range would make the
+            // depth breathe again, which is the thing this mode exists to remove.
+            let lowRes = clip((reconciled.map - far) / span, min: 0, max: 1)
+            var band: MLXArray
+            if noGuide {
+                band = GuidedFilter.resample(lowRes, height: source.height, width: source.width)
+            } else {
+                let guide = Self.luma(of: cgImage, width: source.width, height: source.height)
+                band = GuidedFilter.upsample(
+                    lowRes: lowRes, guide: guide, radius: guideRadius, epsilon: guideEpsilon
+                )
+            }
+            band = clip(band, min: 0, max: 1)
+            if bandGamma != 1 { band = pow(band, 1.0 / bandGamma) }
+            try writer.append(Self.tenBitCodes(band), frameIndex: index)
+
+            if (index + 1) % 25 == 0 || index + 1 == frameCount {
+                let rate = Double(index + 1) / (CFAbsoluteTimeGetCurrent() - started)
+                let eta = Double(frameCount - index - 1) / max(rate, 1e-6)
+                print(String(format: "  %d/%d  %.2f fps  eta %.0fs",
+                             index + 1, frameCount, rate, eta))
+            }
+        }
+        try writer.finish()
+
+        if !scales.isEmpty {
+            let moving = movingFractions.reduce(0, +) / Float(movingFractions.count)
+            print(String(
+                format: "Scale correction %.3f…%.3f, %.1f%% of pixels took their own depth",
+                scales.min()!, scales.max()!, moving * 100
+            ))
+        }
+        _ = staticMap
+        return depthURL.lastPathComponent
+    }
+
+    /// 0...1 map -> 10-bit codes.
+    private static func tenBitCodes(_ map: MLXArray) -> [UInt16] {
+        let quantized = clip(MLX.round(map * 1023), min: 0, max: 1023).asType(.uint16)
+        eval(quantized)
+        return quantized.asArray(UInt16.self)
     }
 
     // MARK: - Helpers

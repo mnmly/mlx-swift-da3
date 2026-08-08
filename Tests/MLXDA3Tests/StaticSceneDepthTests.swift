@@ -158,3 +158,82 @@ final class GuidedFilterTests: XCTestCase {
         XCTAssertGreaterThan(row[42].item(Float.self), 0.75)
     }
 }
+
+/// `reconcile` is what lets a locked-off clip keep a rock-steady background *and*
+/// give moving subjects their own depth. These pin both halves of that bargain.
+final class ReconcileTests: XCTestCase {
+
+    private func ramp(_ h: Int, _ w: Int) -> MLXArray {
+        var v = [Float]()
+        for r in 0 ..< h { for c in 0 ..< w { v.append(1.0 + Float(r * w + c) / Float(h * w)) } }
+        return MLXArray(v, [h, w])
+    }
+
+    /// A frame that is the static map times a constant is *only* a scale error —
+    /// exactly the drift that makes an unstabilized cloud breathe. It must come back
+    /// as the static map, with the scale reported.
+    func testGlobalScaleIsRemoved() {
+        let staticMap = ramp(24, 32)
+        let frame = staticMap * 1.3
+
+        let out = StaticSceneDepth.reconcile(frame: frame, staticMap: staticMap)
+        eval(out.map)
+        XCTAssertEqual(out.scale, 1.3, accuracy: 1e-3)
+        XCTAssertLessThan(abs(out.map - staticMap).max().item(Float.self), 1e-3)
+        XCTAssertLessThan(out.movingFraction, 0.01)
+    }
+
+    /// Where something moved, the frame's own depth must win.
+    func testMovingRegionTakesTheFrameDepth() {
+        let h = 24, w = 32
+        let staticMap = MLXArray.ones([h, w]) * 2.0
+        var frameValues = [Float](repeating: 2.0, count: h * w)
+        // A patch that is much nearer than the background — a boat crossing the water.
+        for r in 8 ..< 16 { for c in 10 ..< 20 { frameValues[r * w + c] = 6.0 } }
+        let frame = MLXArray(frameValues, [h, w])
+
+        let out = StaticSceneDepth.reconcile(frame: frame, staticMap: staticMap)
+        eval(out.map)
+        let got: [Float] = out.map.asArray(Float.self)
+
+        // Inside the patch: the frame's value (the global scale is ~1 since the patch
+        // is a minority of pixels, so the median ratio stays at the background).
+        XCTAssertEqual(got[12 * w + 15], 6.0, accuracy: 0.2)
+        // Outside: untouched background.
+        XCTAssertEqual(got[2 * w + 2], 2.0, accuracy: 1e-3)
+        // Roughly the patch's share of the frame.
+        XCTAssertEqual(out.movingFraction, Float(8 * 10) / Float(h * w), accuracy: 0.02)
+    }
+
+    /// Noise below the agreement threshold must not leak through, or the background
+    /// shimmers — the whole reason the static map exists.
+    func testSmallNoiseIsRejected() {
+        let staticMap = ramp(24, 32)
+        MLXRandom.seed(4)
+        let noise = MLXRandom.normal([24, 32]) * 0.01   // 1%, well under agreeBelow
+        let frame = staticMap * (1.0 + noise)
+
+        let out = StaticSceneDepth.reconcile(frame: frame, staticMap: staticMap)
+        eval(out.map)
+        XCTAssertLessThan(abs(out.map - staticMap).max().item(Float.self), 0.01)
+        XCTAssertEqual(out.movingFraction, 0, accuracy: 1e-6)
+    }
+
+    /// The handover between the two estimates has to be smooth, or a moving edge pops.
+    func testBlendIsMonotonicAcrossTheThreshold() {
+        let staticMap = MLXArray.ones([1, 64]) * 2.0
+        // Residuals sweeping 0 -> 40%, so the blend weight sweeps its whole range.
+        var v = [Float]()
+        for c in 0 ..< 64 { v.append(2.0 * (1.0 + Float(c) / 64 * 0.4)) }
+        let frame = MLXArray(v, [1, 64])
+
+        let out = StaticSceneDepth.reconcile(
+            frame: frame, staticMap: staticMap, agreeBelow: 0.05, disagreeAbove: 0.20
+        )
+        eval(out.map)
+        let got: [Float] = out.map.asArray(Float.self)
+        for c in 1 ..< 64 {
+            XCTAssertGreaterThanOrEqual(got[c], got[c - 1] - 1e-5, "blend must not reverse at \(c)")
+        }
+    }
+}

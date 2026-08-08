@@ -295,6 +295,32 @@ Output is one HEVC file at twice the source height — colour on top, inverse de
 normalized to 0...1 below — plus a `<clip>.stereodepth.json` sidecar describing the
 mapping. A 752-frame 4K clip takes ~90 s end to end.
 
+### `--depth-sequence`: per-frame depth without the breathing
+
+A locked-off camera does not mean a locked-off *scene*. If subjects move — boats
+crossing water, a figure walking — a single static map pins them to whatever depth
+the background had there. But naively inferring every frame brings back the ~30%
+global scale drift that makes the whole cloud surge toward the viewer.
+
+`--depth-sequence` keeps both. For each frame it estimates depth, divides out a
+robust global scale measured against the static map (the correction lands in
+0.98…1.04 — small, precisely because the geometry really is fixed), and then blends:
+the static map where the frame agrees with it, the frame's own depth where it does
+not. Background locked, movers correct.
+
+Output is a separate **10-bit** depth movie (`<clip>.depth.mov`, HEVC Main10, luma
+only) — 4× the codes of an 8-bit band, and a fraction of the size since depth
+compresses far better than colour. On a 752-frame 4K clip: ~7 MB.
+
+    --depth-stride N   infer every Nth frame and hold between (depth drifts slowly)
+    --agree-below      residual under which the static map is kept outright
+    --disagree-above   residual over which the frame's own depth wins
+
+One packing detail worth knowing if you write a consumer: `420YpCbCr10BiPlanar`
+keeps its 10-bit samples **left-aligned** in each 16-bit word. Bind the luma plane as
+`.r16Unorm` and you get code/1024 in 0...1 directly. Write them right-aligned and you
+silently throw away six bits — a 512-step ramp comes back with 14 distinct values.
+
 ### `--depth-image`: don't store a constant as a video
 
 With a locked-off camera the depth band is *identical in every frame*, so a video of

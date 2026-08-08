@@ -214,6 +214,114 @@ final class VideoWriter {
     }
 }
 
+/// Writes a single-channel depth sequence as 10-bit HEVC.
+///
+/// Depth is a smooth gradient, which is exactly what an 8-bit band quantises into
+/// visible planes. 10-bit luma quadruples the codes; because the signal is grey we
+/// can author the YUV planes directly — chroma is a constant — and skip the RGB→YUV
+/// conversion and its limited-range squeeze entirely.
+///
+/// Note the sample packing: `420YpCbCr10BiPlanar` keeps its 10-bit samples
+/// **left-aligned** in each 16-bit word. Writing them right-aligned silently throws
+/// away six bits (verified: a 512-step ramp came back with 14 distinct values).
+final class DepthVideoWriter {
+    static let fullRangeFormat = kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+
+    private let writer: AVAssetWriter
+    private let input: AVAssetWriterInput
+    private let adaptor: AVAssetWriterInputPixelBufferAdaptor
+    private let width: Int
+    private let height: Int
+    private let fps: Double
+
+    init(url: URL, width: Int, height: Int, fps: Double, bitrate: Int) throws {
+        try? FileManager.default.removeItem(at: url)
+        self.writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        self.width = width
+        self.height = height
+        self.fps = fps
+
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.hevc,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel,
+                AVVideoAverageBitRateKey: bitrate,
+                AVVideoMaxKeyFrameIntervalKey: 30,
+            ],
+        ]
+        self.input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        input.expectsMediaDataInRealTime = false
+        self.adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: Self.fullRangeFormat,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+            ]
+        )
+        guard writer.canAdd(input) else { throw VideoError("cannot add depth writer input") }
+        writer.add(input)
+        guard writer.startWriting() else {
+            throw VideoError("could not start depth writer: \(writer.error?.localizedDescription ?? "?")")
+        }
+        writer.startSession(atSourceTime: .zero)
+    }
+
+    /// `samples` is one 10-bit code (0...1023) per pixel, row-major.
+    func append(_ samples: [UInt16], frameIndex: Int) throws {
+        while !input.isReadyForMoreMediaData { usleep(2000) }
+
+        guard let pool = adaptor.pixelBufferPool else { throw VideoError("no depth buffer pool") }
+        var maybeBuffer: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &maybeBuffer) == kCVReturnSuccess,
+              let buffer = maybeBuffer
+        else { throw VideoError("could not allocate depth buffer") }
+
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+
+        guard let luma = CVPixelBufferGetBaseAddressOfPlane(buffer, 0)?
+            .assumingMemoryBound(to: UInt16.self),
+            let chroma = CVPixelBufferGetBaseAddressOfPlane(buffer, 1)?
+            .assumingMemoryBound(to: UInt16.self)
+        else { throw VideoError("null depth plane") }
+
+        let lumaStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0) / 2
+        samples.withUnsafeBufferPointer { src in
+            for row in 0 ..< height {
+                let line = src.baseAddress! + row * width
+                let out = luma + row * lumaStride
+                for x in 0 ..< width { out[x] = line[x] << 6 }
+            }
+        }
+        // Neutral chroma, also left-aligned.
+        let chromaStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1) / 2
+        let neutral: UInt16 = 512 << 6
+        for row in 0 ..< (height / 2) {
+            let out = chroma + row * chromaStride
+            for x in 0 ..< width { out[x] = neutral }
+        }
+
+        let time = CMTime(value: CMTimeValue(frameIndex), timescale: CMTimeScale(fps.rounded()))
+        guard adaptor.append(buffer, withPresentationTime: time) else {
+            throw VideoError("depth append failed at \(frameIndex): "
+                + (writer.error?.localizedDescription ?? "?"))
+        }
+    }
+
+    func finish() throws {
+        input.markAsFinished()
+        let semaphore = DispatchSemaphore(value: 0)
+        writer.finishWriting { semaphore.signal() }
+        semaphore.wait()
+        if writer.status == .failed {
+            throw VideoError("depth write failed: \(writer.error?.localizedDescription ?? "?")")
+        }
+    }
+}
+
 struct VideoError: Error, CustomStringConvertible {
     let description: String
     init(_ description: String) { self.description = description }

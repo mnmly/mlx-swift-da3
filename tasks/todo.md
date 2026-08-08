@@ -858,3 +858,29 @@ subsampling, no temporal smearing of a signal that never changes.
 `--band-gamma` remains for the case where the band must stay an 8-bit video: a
 consumer that already applies a power curve to the sample undoes it for free by
 setting that exponent.
+
+
+### 2026-08-08 — `--depth-sequence`: per-frame depth without the breathing
+
+A locked-off camera is not a locked-off scene. On the test clip the static map is
+right for the architecture (upper two thirds: near-zero residual) and wrong for the
+water and boats — measured 44% of pixels in the water band on a mid-clip frame, 98%
+by the end. The animated subjects were pinned to the background plane.
+
+Naively inferring every frame brings back the 30% scale drift. So: infer each frame,
+divide out a robust global scale measured against the static median, then blend by
+residual — static map where they agree, frame where they do not. Measured on the
+clip: scale corrections land in 0.975…1.043 (tiny, because the geometry really is
+fixed) and ~2% of pixels take their own depth.
+
+Output is a separate 10-bit depth movie rather than an 8-bit band.
+
+**The packing trap.** `420YpCbCr10BiPlanar` keeps 10-bit samples **left-aligned** in
+each 16-bit word. Writing them right-aligned silently discards six bits: a 512-step
+ramp round-tripped to *14 distinct values*. The tell was that HEVC, HEVC-quality,
+ProRes 422 HQ and ProRes 4444 all produced byte-identical corruption — four codecs
+cannot fail the same way, so the bug had to be mine. Shifted left, HEVC Main10 is
+exact (0, 512, 1023 -> 0, 512, 1023) and ProRes is actually *worse* (476/512, ±1).
+
+Verified on the real output: `yuv420p10le`, full range, 269 codes for the subject vs
+75 for the 8-bit stacked band.
