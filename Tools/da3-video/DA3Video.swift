@@ -3,6 +3,7 @@ import AVFoundation
 import CoreGraphics
 import CoreVideo
 import Foundation
+import ImageIO
 import MLX
 import MLXDA3
 
@@ -65,8 +66,14 @@ struct DA3Video: ParsableCommand {
     @Flag(name: .long, help: "Skip the guided upsample and use a plain resize.")
     var noGuide: Bool = false
 
-    @Option(name: .long, help: "Output bitrate in Mbps.")
+    @Option(name: .long, help: "Output bitrate in Mbps (video output only).")
     var bitrateMbps: Int = 40
+
+    @Option(name: .long, help: "Store the band as value^(1/gamma). The consumer raises the sampled value to the same power. 1 = off. Only worth it for an 8-bit video band.")
+    var bandGamma: Float = 1.0
+
+    @Flag(name: .long, help: "With --static-camera: write the depth map as a single 16-bit PNG instead of a video, and leave the colour clip untouched.")
+    var depthImage: Bool = false
 
     @Option(name: .long, help: "Stop after N source frames (0 = all).")
     var frames: Int = 0
@@ -155,28 +162,57 @@ struct DA3Video: ParsableCommand {
                   + "(radius \(guideRadius), epsilon \(guideEpsilon))")
         }
         band = clip(band, min: 0, max: 1)
+
+        // A gamma curve buys effective codes when the band is stored in 8 bits and the
+        // subject sits at one end of the range — the consumer raises the sampled value
+        // back to `bandGamma`. It is pointless for the 16-bit still, which has codes to
+        // spare.
+        if bandGamma != 1 && !depthImage {
+            band = pow(band, 1.0 / bandGamma)
+            print("Band stored with gamma \(bandGamma); consumer must raise samples to \(bandGamma)")
+        }
         eval(band)
 
-        // ---- 4. write colour over the constant disparity band -----------------
-        let bandBytes = Self.grayBytes(band, width: source.width, height: source.height)
-        let writer = try VideoWriter(
-            url: outputURL, width: source.width, height: source.height * 2,
-            fps: source.fps, bitrate: bitrateMbps * 1_000_000
-        )
-        print("Writing \(outputURL.lastPathComponent) (\(source.width)x\(source.height * 2))…")
-        try source.forEachFrame(limit: frameCount) { index, pixelBuffer in
-            try writer.append(colour: pixelBuffer, depthBand: bandBytes, frameIndex: index)
-            if (index + 1) % 100 == 0 {
-                print("  \(index + 1)/\(frameCount)")
+        // ---- 4. write the depth, either as a still or under the colour ---------
+        let depthOutput: String
+        if depthImage {
+            // With a locked-off camera the band is the same in every frame, so a video
+            // of it is 752 copies of one image, quantized to 8 bits and put through
+            // chroma subsampling and a lossy codec for no reason. A single 16-bit PNG is
+            // exact, ~250x more codes, and leaves the colour clip untouched.
+            let pngURL = outputURL
+                .deletingPathExtension().deletingPathExtension()
+                .appendingPathExtension("depth.png")
+            try Self.writeGray16PNG(band, to: pngURL)
+            depthOutput = pngURL.lastPathComponent
+            print("Depth still -> \(depthOutput) (16-bit, \(source.width)x\(source.height))")
+        } else {
+            let bandBytes = Self.grayBytes(band, width: source.width, height: source.height)
+            let writer = try VideoWriter(
+                url: outputURL, width: source.width, height: source.height * 2,
+                fps: source.fps, bitrate: bitrateMbps * 1_000_000
+            )
+            print("Writing \(outputURL.lastPathComponent) (\(source.width)x\(source.height * 2))…")
+            try source.forEachFrame(limit: frameCount) { index, pixelBuffer in
+                try writer.append(colour: pixelBuffer, depthBand: bandBytes, frameIndex: index)
+                if (index + 1) % 100 == 0 {
+                    print("  \(index + 1)/\(frameCount)")
+                }
             }
+            try writer.finish()
+            depthOutput = outputURL.lastPathComponent
         }
-        try writer.finish()
 
         // ---- 5. sidecar -------------------------------------------------------
         let sidecar: [String: Any] = [
             "source": inputURL.lastPathComponent,
-            "video": outputURL.lastPathComponent,
-            "layout": "colour-over-disparity",
+            // `video` is what the consumer samples: the stacked clip, or — for a depth
+            // still — the untouched source, with the depth in `depthImage`.
+            "video": depthImage ? inputURL.lastPathComponent : outputURL.lastPathComponent,
+            "depthImage": depthImage ? depthOutput : "",
+            "bandGamma": depthImage ? 1.0 : Double(bandGamma),
+            "bandBits": depthImage ? 16 : 8,
+            "layout": depthImage ? "colour-plus-depth-still" : "colour-over-disparity",
             "width": source.width,
             "height": source.height,
             "eyeWidth": source.width,
@@ -234,6 +270,39 @@ struct DA3Video: ParsableCommand {
             : DA3ImagePreprocessing.resize(rgb, height: height, width: width, method: .area)
         let weights = MLXArray([Float(0.2126), 0.7152, 0.0722], [1, 1, 3])
         return (resized * weights).sum(axis: -1) / 255.0
+    }
+
+    /// 0...1 map -> a 16-bit grayscale PNG. 65536 codes, no chroma subsampling, no
+    /// YUV range squeeze, no lossy codec — the depth arrives as computed.
+    private static func writeGray16PNG(_ map: MLXArray, to url: URL) throws {
+        let height = map.dim(0)
+        let width = map.dim(1)
+        let quantized = clip(MLX.round(map * 65535), min: 0, max: 65535).asType(.uint16)
+        eval(quantized)
+        var samples: [UInt16] = quantized.asArray(UInt16.self)
+
+        let data = samples.withUnsafeMutableBytes { raw in
+            CFDataCreate(nil, raw.baseAddress!.assumingMemoryBound(to: UInt8.self), raw.count)!
+        }
+        guard let provider = CGDataProvider(data: data),
+              let image = CGImage(
+                  width: width, height: height,
+                  bitsPerComponent: 16, bitsPerPixel: 16,
+                  bytesPerRow: width * 2,
+                  space: CGColorSpaceCreateDeviceGray(),
+                  bitmapInfo: CGBitmapInfo(rawValue: CGImageByteOrderInfo.order16Little.rawValue),
+                  provider: provider, decode: nil, shouldInterpolate: false,
+                  intent: .defaultIntent
+              )
+        else { throw VideoError("could not build 16-bit image") }
+
+        guard let destination = CGImageDestinationCreateWithURL(
+            url as CFURL, "public.png" as CFString, 1, nil
+        ) else { throw VideoError("could not create PNG at \(url.path)") }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw VideoError("could not write \(url.lastPathComponent)")
+        }
     }
 
     /// 0...1 map -> one byte per pixel.

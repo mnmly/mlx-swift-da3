@@ -829,3 +829,32 @@ spread and 30.2% global scale drift across the sequence — the whole cloud brea
 
 752-frame 4K clip: 88 s end to end (54 sampled forwards at 0.8 fps, then decode +
 compose + HEVC encode of 3840×4320).
+
+
+### 2026-08-08 — `--depth-image`, and why 10-bit was the wrong lever
+
+Follow-up question was whether to move the band to 10-bit (hevc_videotoolbox supports
+Main10). It would be 4x the codes, but two things gated it first: the writer quantized
+to UInt8 before the pixel buffer, and the consuming sketch requested BGRA and built a
+`.bgra8Unorm` texture, so a 10-bit file would be converted down on decode. The output
+was also tagged `color_range=tv`, squeezing 0-255 into 16-235.
+
+More to the point, bit depth was not the binding constraint. On the test clip the
+subject's depth sits at a mean normalized value of 0.065 — the bottom 6.5% of the
+range — so it only ever touches ~75 of 256 codes. Counting distinct codes the subject
+receives:
+
+    linear 8-bit (was)   75
+    gamma 2.2, 8-bit    132
+    linear 10-bit       299
+    16-bit still     28,803
+
+So `--depth-image`: for a locked-off camera the band is constant, and storing a
+constant as 752 video frames is the actual waste. One 16-bit PNG is 384x the effective
+precision at a tenth the size (7.7 MB vs 79 MB), skips the encode pass entirely, and
+leaves the colour clip untouched — no re-encode, no generation loss, no chroma
+subsampling, no temporal smearing of a signal that never changes.
+
+`--band-gamma` remains for the case where the band must stay an 8-bit video: a
+consumer that already applies a power curve to the sample undoes it for free by
+setting that exponent.

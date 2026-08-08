@@ -295,6 +295,29 @@ Output is one HEVC file at twice the source height — colour on top, inverse de
 normalized to 0...1 below — plus a `<clip>.stereodepth.json` sidecar describing the
 mapping. A 752-frame 4K clip takes ~90 s end to end.
 
+### `--depth-image`: don't store a constant as a video
+
+With a locked-off camera the depth band is *identical in every frame*, so a video of
+it is N copies of one image, quantized to 8 bits and put through chroma subsampling
+and a lossy codec for nothing. `--depth-image` writes a single 16-bit PNG instead and
+leaves the colour clip untouched.
+
+Measured on a 4K painting, counting the distinct codes the *subject* actually
+receives (its depth sits in the bottom 6.5% of the range, so it never sees most of an
+8-bit ramp):
+
+| storage | subject codes | size |
+|---|---|---|
+| stacked 8-bit video band | 75 | 79 MB |
+| same, 10-bit | 299 | ~79 MB |
+| **16-bit still** | **28,803** | **7.7 MB** |
+
+The sidecar then names `depthImage` and sets `video` to the untouched source, so a
+consumer samples colour from the original clip and depth from the still. For an 8-bit
+band that must stay a video, `--band-gamma 2.2` buys ~1.8× the effective codes; a
+consumer that already applies a power curve to the sampled value undoes it by setting
+that exponent.
+
 Knobs worth knowing:
 
 | flag | why |
