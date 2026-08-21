@@ -11,9 +11,6 @@ let package = Package(
     products: [
         .library(name: "MLXDA3", targets: ["MLXDA3"]),
         .library(name: "MLXDA3Streaming", targets: ["MLXDA3Streaming"]),
-        // GPL-3.0 (derived from serizba/salad) — kept in its own product so the
-        // Apache-2.0 targets can be used without it. See THIRD-PARTY-NOTICES.md.
-        .library(name: "MLXDA3SALAD", targets: ["MLXDA3SALAD"]),
         .executable(name: "da3-tool", targets: ["da3-tool"]),
         .executable(name: "da3-bench", targets: ["da3-bench"]),
         .executable(name: "da3-streaming-tool", targets: ["da3-streaming-tool"]),
@@ -22,9 +19,12 @@ let package = Package(
         .executable(name: "da3-video", targets: ["da3-video"])
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", branch: "main"),
-        .package(url: "https://github.com/huggingface/swift-transformers.git", branch: "main"),
-        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.2.0")
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.31.6"),
+        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.2.0"),
+        // GPL-3.0 (port of serizba/salad). Only `da3-loop-tool`, the DA3Demo
+        // example app, and the test target link it — `MLXDA3` and
+        // `MLXDA3Streaming` do not. See THIRD-PARTY-NOTICES.md.
+        .package(url: "https://github.com/mnmly/mlx-swift-salad.git", from: "0.1.0")
     ],
     targets: [
         .target(
@@ -32,7 +32,6 @@ let package = Package(
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "Transformers", package: "swift-transformers"),
             ]
         ),
         .executableTarget(
@@ -77,14 +76,6 @@ let package = Package(
             ],
             path: "Tools/da3-streaming-bench"
         ),
-        .target(
-            name: "MLXDA3SALAD",
-            dependencies: [
-                "MLXDA3",
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXNN", package: "mlx-swift")
-            ]
-        ),
         .executableTarget(
             name: "da3-video",
             dependencies: [
@@ -97,14 +88,18 @@ let package = Package(
             name: "da3-loop-tool",
             dependencies: [
                 "MLXDA3Streaming",
-                "MLXDA3SALAD",
+                .product(name: "MLXSALAD", package: "mlx-swift-salad"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Tools/da3-loop-tool"
         ),
         .testTarget(
             name: "MLXDA3Tests",
-            dependencies: ["MLXDA3", "MLXDA3Streaming", "MLXDA3SALAD"]
+            dependencies: [
+                "MLXDA3",
+                "MLXDA3Streaming",
+                .product(name: "MLXSALAD", package: "mlx-swift-salad")
+            ]
         )
     ]
 )

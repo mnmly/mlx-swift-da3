@@ -664,7 +664,8 @@ coef`, which is what python line 670 actually does.
 
 - Dropped the deprecated `MLXFast` / `MLXLinalg` products: `scaledDotProductAttention`,
   `svd`, `qr` all come from plain `import MLX` on current mlx-swift.
-- SALAD moved out of `MLXDA3Streaming` into its own `MLXDA3SALAD` target/product.
+- SALAD moved out of `MLXDA3Streaming` into its own `MLXDA3SALAD` target/product,
+  then extracted again into a standalone `mlx-swift-salad` package (module `MLXSALAD`).
   It is a port of serizba/salad, which is **GPL-3.0**, while everything else here is
   Apache-2.0 (upstream DA3's licence). Nothing in `MLXDA3`/`MLXDA3Streaming` depended
   on it — `StreamingPipeline` takes loop constraints as plain data — so the split cost

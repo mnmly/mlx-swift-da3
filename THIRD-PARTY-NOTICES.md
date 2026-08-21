@@ -19,24 +19,24 @@ Runtime dependencies:
 - [swift-transformers](https://github.com/huggingface/swift-transformers) — Apache-2.0
 - [swift-argument-parser](https://github.com/apple/swift-argument-parser) — Apache-2.0
 
-## GPL-3.0 — `MLXDA3SALAD` (loop-closure place recognition)
+## GPL-3.0 — `MLXSALAD` (loop-closure place recognition), external dependency
 
-`Sources/MLXDA3SALAD` (`Salad.swift`, `SaladWeightLoading.swift`, `LoopDetector.swift`) is a
-port of [serizba/salad](https://github.com/serizba/salad) ("Optimal Transport Aggregation for
-Visual Place Recognition", Izquierdo & Civera, CVPR 2024), which is licensed **GPL-3.0**. The
-port is a derivative work and is therefore covered by GPL-3.0, not by this repository's
-Apache-2.0 licence.
+SALAD place recognition is **not** part of this repository. It lives in
+[mlx-swift-salad](https://github.com/mnmly/mlx-swift-salad), a port of
+[serizba/salad](https://github.com/serizba/salad) ("Optimal Transport Aggregation for Visual
+Place Recognition", Izquierdo & Civera, CVPR 2024), which is licensed **GPL-3.0**. That port
+is a derivative work and is covered by GPL-3.0, not by this repository's Apache-2.0 licence.
 
-It is isolated in its own SwiftPM target and product for that reason:
+It is a separate package for that reason:
 
 - `MLXDA3` and `MLXDA3Streaming` do **not** depend on it. The streaming pipeline accepts
   loop constraints as plain data (`StreamingPipeline.predict(images:loopConstraints:)`), so
   any place-recognition front end can supply them.
-- Only `da3-loop-tool` and the `DA3Demo` example app link it.
+- Only `da3-loop-tool`, the `DA3Demo` example app, and the test target link it.
 
-If you distribute a product that links `MLXDA3SALAD`, that product must comply with
-GPL-3.0. To avoid this, depend on `MLXDA3` / `MLXDA3Streaming` only and supply loop
-constraints from your own detector.
+If you distribute a product that links `MLXSALAD`, that product must comply with GPL-3.0.
+To avoid this, depend on `MLXDA3` / `MLXDA3Streaming` only and supply loop constraints from
+your own detector.
 
 The SALAD weights (`dino_salad.ckpt`, from the serizba/salad releases) are likewise
 governed by that project's terms and are not redistributed here.

@@ -34,8 +34,11 @@ struct DA3Video: ParsableCommand {
     @Option(name: .shortAndLong, help: "Model config name.")
     var model: String = "da3-large"
 
-    @Option(name: .shortAndLong, help: "Path to model.safetensors.")
-    var weights: String
+    @Option(name: .shortAndLong, help: "Path to model.safetensors. Required unless --depth-safetensors is given.")
+    var weights: String?
+
+    @Option(name: .long, help: "Read depth from a precomputed (N, H, W) float32 safetensors instead of running DA3 — e.g. `vda infer --save-raw` from mlx-swift-VideoDepthAnything. Values are taken to be INVERSE depth already.")
+    var depthSafetensors: String?
 
     @Option(name: .long, help: "Resolution DA3 runs at, long edge. Past ~2072 the ViT is far enough outside its trained token grid that geometry degrades.")
     var resolution: Int = 2072
@@ -91,6 +94,45 @@ struct DA3Video: ParsableCommand {
     @Option(name: .long, help: "Stop after N source frames (0 = all).")
     var frames: Int = 0
 
+    /// Where each frame's inverse-depth map comes from.
+    ///
+    /// DA3 runs here, frame by frame. A video model with temporal modules
+    /// (Video-Depth-Anything) instead runs its own sliding window over the whole
+    /// clip ahead of time, so its output arrives as one tensor and this tool only
+    /// normalizes, upsamples and encodes it. Both arrive as `[H, W]` of 1/Z.
+    private enum DepthProvider {
+        case model(DepthAnything3, ImageProcessor, DType)
+        case precomputed(MLXArray)          // [N, H, W], already inverse depth
+
+        /// `[H, W]` inverse depth for one frame. `image` is unused when the maps
+        /// were computed elsewhere.
+        func inverseMap(frame index: Int, image: CGImage) throws -> MLXArray {
+            switch self {
+            case let .model(da3, processor, dtype):
+                let batch = processor(image).expandedDimensions(axis: 1).asType(dtype)
+                guard let depth = da3(batch)["depth"] else {
+                    throw VideoError("model produced no depth at frame \(index)")
+                }
+                return StaticSceneDepth.inverseDepth(depth.asType(.float32).squeezed())
+            case let .precomputed(maps):
+                guard index < maps.dim(0) else {
+                    throw VideoError("frame \(index) is past the \(maps.dim(0)) precomputed maps")
+                }
+                return maps[index]
+            }
+        }
+
+        /// Precomputed video-model depth is already temporally consistent, so
+        /// reconciling it against a static median would be redundant. It is also
+        /// ill-posed: these models pin the sky to exactly 0, and the robust
+        /// frame-to-clip scale is a median over `frame / static`, which collapses to
+        /// 0 once more than half the pixels are 0 on both sides.
+        var needsStabilization: Bool {
+            if case .model = self { return true }
+            return false
+        }
+    }
+
     mutating func run() throws {
         let inputURL = URL(fileURLWithPath: input)
         let outputURL = URL(fileURLWithPath: output ?? Self.defaultOutput(for: inputURL))
@@ -109,12 +151,32 @@ struct DA3Video: ParsableCommand {
             )
         }
 
-        print("Loading \(model)…")
-        let da3 = try loadModel(
-            configName: model,
-            weightsURL: URL(fileURLWithPath: try Self.resolveWeights(weights)),
-            dtype: targetDtype
-        )
+        let processor = ImageProcessor(processRes: resolution)
+        let depth: DepthProvider
+        switch (weights, depthSafetensors) {
+        case (nil, nil), (.some, .some):
+            throw ValidationError("pass exactly one of --weights or --depth-safetensors")
+        case let (_, .some(path)):
+            let loaded = try MLX.loadArrays(url: URL(fileURLWithPath: path))
+            guard let maps = loaded["depth"] ?? loaded.sorted(by: { $0.key < $1.key }).first?.value
+            else { throw ValidationError("no arrays in \(path)") }
+            guard maps.ndim == 3 else {
+                throw ValidationError("expected (N, H, W), got \(maps.shape)")
+            }
+            print("Precomputed depth: \(maps.dim(0)) maps at \(maps.dim(2))x\(maps.dim(1))"
+                  + " (already inverse depth)")
+            depth = .precomputed(maps.asType(.float32))
+        case let (.some(path), _):
+            print("Loading \(model)…")
+            depth = .model(
+                try loadModel(
+                    configName: model,
+                    weightsURL: URL(fileURLWithPath: try Self.resolveWeights(path)),
+                    dtype: targetDtype
+                ),
+                processor, targetDtype
+            )
+        }
 
         // ---- 1. sample frames evenly across the clip -------------------------
         let stride = max(1, frameCount / max(samples, 1))
@@ -123,16 +185,11 @@ struct DA3Video: ParsableCommand {
         let sampled = try source.frames(at: Set(sampleIndices))
 
         // ---- 2. depth per sample, medianed into one static band --------------
-        let processor = ImageProcessor(processRes: resolution)
         var inverseMaps: [MLXArray] = []
         inverseMaps.reserveCapacity(sampled.count)
         let started = CFAbsoluteTimeGetCurrent()
         for (i, image) in sampled.enumerated() {
-            let batch = processor(image).expandedDimensions(axis: 1).asType(targetDtype)
-            guard let depth = da3(batch)["depth"] else {
-                throw ValidationError("model produced no depth")
-            }
-            let map = StaticSceneDepth.inverseDepth(depth.asType(.float32).squeezed())
+            let map = try depth.inverseMap(frame: sampleIndices[i], image: image)
             eval(map)
             inverseMaps.append(map)
             if (i + 1) % 10 == 0 || i + 1 == sampled.count {
@@ -190,8 +247,8 @@ struct DA3Video: ParsableCommand {
         let depthOutput: String
         if depthSequence {
             depthOutput = try writeDepthSequence(
-                source: source, frameCount: frameCount, model: da3, dtype: targetDtype,
-                processor: processor, staticMap: normalized.map, rawStatic: median,
+                source: source, frameCount: frameCount, depth: depth,
+                staticMap: normalized.map, rawStatic: median,
                 near: normalized.near, far: normalized.far, outputURL: outputURL
             )
         } else if depthImage {
@@ -244,9 +301,10 @@ struct DA3Video: ParsableCommand {
             "fps": source.fps,
             "disparityMin": 0.0,
             "disparityMax": disparityMax,
-            "depthSource": "depth-anything-3",
-            "depthModel": model,
-            "depthResolution": resolution,
+            "depthSource": depthSafetensors == nil ? "depth-anything-3" : "precomputed",
+            "depthModel": depthSafetensors.map { URL(fileURLWithPath: $0).lastPathComponent }
+                ?? model,
+            "depthResolution": depthSafetensors == nil ? resolution : median.dim(1),
             "inverseDepthNear": Double(normalized.near),
             "inverseDepthFar": Double(normalized.far),
             "nearPercentile": Double(nearPercentile),
@@ -272,8 +330,8 @@ struct DA3Video: ParsableCommand {
     /// geometry, upsample it guided by that frame's own colour, and write it to a
     /// 10-bit depth movie.
     private func writeDepthSequence(
-        source: VideoSource, frameCount: Int, model da3: DepthAnything3, dtype: DType,
-        processor: ImageProcessor, staticMap: MLXArray, rawStatic: MLXArray,
+        source: VideoSource, frameCount: Int, depth: DepthProvider,
+        staticMap: MLXArray, rawStatic: MLXArray,
         near: Float, far: Float, outputURL: URL
     ) throws -> String {
         let depthURL = outputURL
@@ -283,8 +341,14 @@ struct DA3Video: ParsableCommand {
             url: depthURL, width: source.width, height: source.height,
             fps: source.fps, bitrate: bitrateMbps * 1_000_000
         )
-        print("Per-frame depth -> \(depthURL.lastPathComponent) "
-              + "(10-bit, stride \(depthStride), agree \(agreeBelow)…\(disagreeAbove))")
+        if depth.needsStabilization {
+            print("Per-frame depth -> \(depthURL.lastPathComponent) "
+                  + "(10-bit, stride \(depthStride), agree \(agreeBelow)…\(disagreeAbove))")
+        } else {
+            print("Per-frame depth -> \(depthURL.lastPathComponent) "
+                  + "(10-bit, stride \(depthStride), stabilization skipped: "
+                  + "precomputed depth is already temporally consistent)")
+        }
 
         let context = CIContext(options: [.useSoftwareRenderer: false])
         let span = max(near - far, 1e-6)
@@ -300,23 +364,25 @@ struct DA3Video: ParsableCommand {
             }
 
             if index % depthStride == 0 || held == nil {
-                let batch = processor(cgImage).expandedDimensions(axis: 1).asType(dtype)
-                guard let depth = da3(batch)["depth"] else {
-                    throw VideoError("model produced no depth at frame \(index)")
-                }
-                held = StaticSceneDepth.inverseDepth(depth.asType(.float32).squeezed())
+                held = try depth.inverseMap(frame: index, image: cgImage)
             }
 
-            let reconciled = StaticSceneDepth.reconcile(
-                frame: held!, staticMap: rawStatic,
-                agreeBelow: agreeBelow, disagreeAbove: disagreeAbove
-            )
-            scales.append(reconciled.scale)
-            movingFractions.append(reconciled.movingFraction)
+            let frameMap: MLXArray
+            if depth.needsStabilization {
+                let reconciled = StaticSceneDepth.reconcile(
+                    frame: held!, staticMap: rawStatic,
+                    agreeBelow: agreeBelow, disagreeAbove: disagreeAbove
+                )
+                scales.append(reconciled.scale)
+                movingFractions.append(reconciled.movingFraction)
+                frameMap = reconciled.map
+            } else {
+                frameMap = held!
+            }
 
             // One global mapping for the whole clip — a per-frame range would make the
             // depth breathe again, which is the thing this mode exists to remove.
-            let lowRes = clip((reconciled.map - far) / span, min: 0, max: 1)
+            let lowRes = clip((frameMap - far) / span, min: 0, max: 1)
             var band: MLXArray
             if noGuide {
                 band = GuidedFilter.resample(lowRes, height: source.height, width: source.width)

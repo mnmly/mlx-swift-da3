@@ -2,11 +2,14 @@
 
 Swift port of [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3) for Apple Silicon, built on [mlx-swift](https://github.com/ml-explore/mlx-swift).
 
-Three products:
+Two products:
 
 - **`MLXDA3`** — the DA3 model (DinoV2 backbone + DPT/DualDPT head) and a `da3-tool` CLI for single-image / multi-view inference.
 - **`MLXDA3Streaming`** — port of the [DA3-Streaming](https://github.com/ByteDance-Seed/Depth-Anything-3/tree/main/da3_streaming) chunked inference pipeline (chunk alignment + Sim(3) pose-graph refinement) and a `da3-streaming-tool` CLI that produces camera poses + a combined point cloud from a directory of frames.
-- **`MLXDA3SALAD`** — SALAD visual place recognition for loop detection. Kept as a separate product because it is **GPL-3.0**, unlike the Apache-2.0 rest of this repo; nothing in `MLXDA3`/`MLXDA3Streaming` depends on it. See [Licence](#licence).
+SALAD visual place recognition (used for loop detection) lives in its own repository,
+[mlx-swift-salad](https://github.com/mnmly/mlx-swift-salad), because it is **GPL-3.0** unlike the
+Apache-2.0 code here. `MLXDA3` and `MLXDA3Streaming` do not depend on it; only `da3-loop-tool`,
+the `DA3Demo` example app, and the test target link it. See [Licence](#licence).
 
 ## Status
 
@@ -86,10 +89,19 @@ bash da3_streaming/scripts/download_weights.sh
 
 ### Loop closure (SALAD VPR)
 
-Loop closure additionally requires the SALAD descriptor weights. The upstream release ships them as a PyTorch `.ckpt` saved on CUDA — convert to MLX-loadable safetensors first:
+Loop closure additionally requires the SALAD descriptor weights, and the converter
+lives in the [mlx-swift-salad](https://github.com/mnmly/mlx-swift-salad) package
+(GPL-3.0, which is why it is not vendored here):
 
 ```bash
-uv run --script Scripts/convert_salad_to_safetensors.py \
+git clone https://github.com/mnmly/mlx-swift-salad.git ../mlx-swift-salad
+```
+
+The upstream release ships the weights as a PyTorch `.ckpt` saved on CUDA — convert to
+MLX-loadable safetensors first:
+
+```bash
+uv run --script ../mlx-swift-salad/Scripts/convert_salad_to_safetensors.py \
     --in  /path/to/Depth-Anything-3/da3_streaming/weights/dino_salad.ckpt \
     --out /path/to/Depth-Anything-3/da3_streaming/weights/dino_salad.safetensors
 ```
@@ -124,7 +136,7 @@ let depth = prediction.depth              // optional MLXArray
 ### Loop detection (SALAD VPR)
 
 ```swift
-import MLXDA3SALAD
+import MLXSALAD
 
 var cfg = LoopDetector.Config()
 cfg.imageSize = (height: 336, width: 336)
@@ -142,7 +154,7 @@ let (descriptors, loops) = detector.detect(images: cgImages)
 The SALAD weights ship as a PyTorch `.ckpt`; convert to safetensors first:
 
 ```bash
-uv run --script Scripts/convert_salad_to_safetensors.py \
+uv run --script ../mlx-swift-salad/Scripts/convert_salad_to_safetensors.py \
     --in /path/to/dino_salad.ckpt \
     --out /path/to/dino_salad.safetensors
 ```
@@ -164,7 +176,7 @@ import MLXDA3Streaming
 let streamingPipeline = try MLXDA3Streaming.fromPretrained(da3WeightsPath, configName: "da3-giant")
 let initialPrediction = streamingPipeline.predict(images: cgImages)
 
-// 2. Run SALAD loop detection on the same frames (needs `import MLXDA3SALAD`).
+// 2. Run SALAD loop detection on the same frames (needs `import MLXSALAD`).
 let detector = try LoopDetector.fromPretrained(saladWeightsPath)
 let (_, loops) = detector.detect(images: cgImages)
 
@@ -321,6 +333,39 @@ keeps its 10-bit samples **left-aligned** in each 16-bit word. Bind the luma pla
 `.r16Unorm` and you get code/1024 in 0...1 directly. Write them right-aligned and you
 silently throw away six bits — a 512-step ramp comes back with 14 distinct values.
 
+### `--depth-safetensors`: bring your own depth
+
+DA3 is one estimator, not the only one. `--depth-safetensors` skips inference entirely
+and reads an `(N, H, W)` float32 tensor of **inverse** depth, keeping everything after
+it — the median, the percentile normalization, the guided upsample, and all three
+band encodings. Written for [Video-Depth-Anything](https://github.com/DepthAnything/Video-Depth-Anything)
+via its Swift port's `vda infer --save-raw`, whose temporal motion modules produce a
+far steadier sequence than per-frame DA3 on the same clip:
+
+```bash
+vda infer --weights weights/vitl --input clip.mov \
+    --input-size 924 --max-res 1920 --save-raw --output-dir out
+
+.xcdd/Build/Products/Release/da3-video \
+  --input clip.mov --output clip.rgbd.mp4 \
+  --depth-safetensors out/clip_depth.safetensors \
+  --static-camera --depth-sequence \
+  --near-percentile 99.5 --far-percentile 0.5
+```
+
+Pass exactly one of `--weights` or `--depth-safetensors`. Values are taken to be 1/Z
+already, so no reciprocal is applied.
+
+With precomputed depth, `--depth-sequence` **skips the stabilization pass**. A video
+model has already done that work, so reconciling against a static median is redundant
+— and ill-posed here: these models pin the sky to exactly 0, and the robust
+frame-to-clip scale is a median over `frame / static`, which collapses to 0 once more
+than half the pixels are 0 on both sides. `--agree-below` / `--disagree-above` /
+`--depth-stride` therefore do nothing in this combination.
+
+That exact-zero far field is also a bonus downstream: it lands on code 0, so a
+consumer culling at zero drops the sky for free, the way block matching used to.
+
 ### `--depth-image`: don't store a constant as a video
 
 With a locked-off camera the depth band is *identical in every frame*, so a video of
@@ -353,6 +398,7 @@ Knobs worth knowing:
 | `--guide-epsilon` | guided-filter regularization in normalized units. 1e-3 keeps edges crisp; too small transfers the *texture* of the guide into depth |
 | `--no-guide` | plain resize instead of the edge-aware upsample |
 | `--samples` | frames medianed. More is smoother and costs one forward pass each |
+| `--depth-safetensors` | use a precomputed `(N, H, W)` inverse-depth tensor instead of running DA3 |
 
 ## da3-tool — single-image / multi-view
 
@@ -413,7 +459,7 @@ Mirrors the non-loop path of Python's `DA3_Streaming.process_long_sequence`:
 | RANSAC sampling | `np.random` (process-global) | seeded per view (`RayPose.randomSeed`) — runs are byte-reproducible |
 | Per-chunk predictions | Spilled to `.npy` between phases | Held in RAM (works for short sequences) |
 | Point-cloud subsample | Reservoir sampling at `sample_ratio<1.0` | Always `sample_ratio=1.0` (no subsample) |
-| Loop closure / SALAD detector | Implemented | Ported in the separate `MLXDA3SALAD` target (GPL-3.0 — see [Licence](#licence)) |
+| Loop closure / SALAD detector | Implemented | Ported in the separate [mlx-swift-salad](https://github.com/mnmly/mlx-swift-salad) package (GPL-3.0 — see [Licence](#licence)) |
 
 ## Tests
 
@@ -431,7 +477,6 @@ Two parity fixture tests live under `Tests/MLXDA3Tests/`:
 | `ReferenceViewSelectionTests` | `select_reference_view` / `reorder_by_reference` / `restore_original_order` for all four strategies | `Scripts/generate_ref_view_fixture.py` |
 | `BackboneRefViewTests` | Backbone forward is permutation-equivariant with content-based ref-view selection (no weights needed) | (none — pure Swift) |
 | `StreamingParityFixtureTests` | End-to-end `StreamingPipeline` (poses + intrinsics + sim3) vs `da3_streaming.DA3_Streaming` | `Scripts/generate_streaming_parity_fixture.py` |
-| `LoopDetectionFixtureTests` | SALAD `LoopDetector` (descriptors + loop pairs) vs python `loop_utils.LoopDetector` | `Scripts/generate_loop_detection_fixture.py` |
 | `Sim3LieGroupTests` | Sim(3) Exp/Log/Compose/Inverse identities (no python dep) | (none — pure Swift) |
 | `Sim3LoopOptimizerTests` | Sim(3) LM smoke (loop-closure cost reduces ≥5×) | (none — pure Swift) |
 | `Sim3LoopOptimizerFixtureTests` | Sim(3) LM trajectory parity vs python `Sim3LoopOptimizer` on a noisy 8-pose ring | `Scripts/generate_sim3_loop_fixture.py` |
@@ -605,10 +650,6 @@ mlx-swift-da3/
 │   │   └── loop/                        # Phase 2: loop closure
 │   │       ├── Sim3LieGroup.swift       # Sim(3) Exp/Log/multiply/inverse (Sophus closed form)
 │   │       └── Sim3LoopOptimizer.swift  # LM pose-graph optimizer with numerical Jacobian
-│   └── MLXDA3SALAD/            # GPL-3.0, isolated: SALAD place recognition
-│       ├── Salad.swift              # SALAD VPR model (DinoV2-B/14 + aggregator)
-│       ├── SaladWeightLoading.swift
-│       └── LoopDetector.swift       # batching + brute-force cosine matching + NMS
 ├── Tests/
 │   ├── Fixtures/                # parity fixtures (.safetensors + .json)
 │   └── MLXDA3Tests/
@@ -635,12 +676,16 @@ mlx-swift-da3/
 
 ## Licence
 
-Apache-2.0 (see [`LICENSE`](LICENSE)), matching upstream Depth Anything 3 — **except**
-`Sources/MLXDA3SALAD`, which is a port of [serizba/salad](https://github.com/serizba/salad)
-and is therefore **GPL-3.0**. It lives in its own SwiftPM target/product and nothing in
-`MLXDA3` or `MLXDA3Streaming` links it: the streaming pipeline takes loop constraints as
-plain data, so you can supply them from any detector. Link `MLXDA3SALAD` only if your
-product can comply with GPL-3.0.
+Apache-2.0 (see [`LICENSE`](LICENSE)), matching upstream Depth Anything 3. Everything in
+this repository is Apache-2.0.
+
+SALAD place recognition is a port of [serizba/salad](https://github.com/serizba/salad) and is
+therefore **GPL-3.0**; it lives in a separate repository,
+[mlx-swift-salad](https://github.com/mnmly/mlx-swift-salad), and is pulled in only by
+`da3-loop-tool`, the `DA3Demo` example app, and the test target. Nothing in `MLXDA3` or
+`MLXDA3Streaming` links it: the streaming pipeline takes loop constraints as plain data, so
+you can supply them from any detector. Depend on `MLXSALAD` only if your product can comply
+with GPL-3.0.
 
 Full attribution for every ported component is in
 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md). No model weights are redistributed here.

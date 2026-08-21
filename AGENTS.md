@@ -8,11 +8,13 @@ This file is a runbook for the next AI agent (or human) picking up the DA3-Strea
 
 - **Phase 1 (chunked streaming, no loop closure) is complete.**
 - **Phase 2 (SALAD detector + Sim3LoopOptimizer + StreamingPipeline integration) is complete.**
-  SALAD now lives in its own GPL-3.0 target, `Sources/MLXDA3SALAD/` (`import MLXDA3SALAD`).
+  SALAD now lives in its own GPL-3.0 package, [mlx-swift-salad](https://github.com/mnmly/mlx-swift-salad)
+  (`import MLXSALAD`), consumed here as a package dependency.
 - The Python reference (`Depth-Anything-3`) is required for any parity work — clone it locally and set the path in `.claude/local-runners/.env` (template at `docs/local-runners.env.example`).
 - Streaming weights: `model.safetensors` from `da3_streaming/weights/` (the nested giant+large checkpoint produced by `download_weights.sh`).
 - Single-image weights: any DA3 HuggingFace repo (`depth-anything/DA3-LARGE-1.1` etc.), downloaded via `huggingface-cli download`.
-- SALAD weights: `dino_salad.ckpt` → run `Scripts/convert_salad_to_safetensors.py` once.
+- SALAD weights: `dino_salad.ckpt` → clone https://github.com/mnmly/mlx-swift-salad next to
+  this repo and run its `Scripts/convert_salad_to_safetensors.py` once.
 - Test inputs live under `tmp/da3_frames/` (8-frame chunked-streaming fixture) and `tmp/da3_robot_frames/` (42-frame loop-closure fixture).
 
 ---
@@ -251,9 +253,10 @@ Sim(3) optimizer, loop-closed streaming. Add new stages the same way — generat
 ## Suggested next tasks (in priority order)
 
 ### 0. Licence boundary — do not break it
-`Sources/MLXDA3SALAD` is GPL-3.0 (ported from serizba/salad); everything else is
-Apache-2.0. `MLXDA3` and `MLXDA3Streaming` must never depend on that target — loop
-constraints cross the boundary as plain data. See `THIRD-PARTY-NOTICES.md`.
+The `mlx-swift-salad` package (`MLXSALAD`) is GPL-3.0 (ported from serizba/salad);
+everything in this repository is Apache-2.0. `MLXDA3` and `MLXDA3Streaming` must never
+depend on that package — loop constraints cross the boundary as plain data. Only
+`da3-loop-tool`, `DA3Demo`, and the test target may link it. See `THIRD-PARTY-NOTICES.md`.
 
 
 ### 2. Loop closure (Phase 2 — biggest single chunk)

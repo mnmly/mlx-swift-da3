@@ -53,7 +53,7 @@ If Xcode complains about the deployment target, set the project to macOS 14+
 - **SALAD weights**: convert the upstream `.ckpt` first:
 
   ```bash
-  uv run --script ../../Scripts/convert_salad_to_safetensors.py \
+  uv run --script ../../../mlx-swift-salad/Scripts/convert_salad_to_safetensors.py \
       --in /path/to/dino_salad.ckpt \
       --out /path/to/dino_salad.safetensors
   ```

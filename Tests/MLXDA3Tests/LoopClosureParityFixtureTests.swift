@@ -4,7 +4,7 @@ import MLX
 import XCTest
 
 @testable import MLXDA3
-@testable import MLXDA3SALAD
+import MLXSALAD
 @testable import MLXDA3Streaming
 
 /// End-to-end parity test for the loop-closure-enabled streaming path.
@@ -29,7 +29,7 @@ import XCTest
 ///
 /// Coverage of the actual optimizer + measurement code paths comes from
 /// the unit fixtures `Sim3LoopOptimizerFixtureTests` and
-/// `LoopDetectionFixtureTests`. End-to-end coverage *with* detected loops
+/// `LoopDetectionFixtureTests` (now in the mlx-swift-salad package). End-to-end coverage *with* detected loops
 /// requires KITTI-style data with real loop closures (not bundled with
 /// either repo).
 final class LoopClosureParityFixtureTests: XCTestCase {
