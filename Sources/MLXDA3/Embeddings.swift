@@ -191,7 +191,9 @@ public class Embeddings: Module {
         }
 
         let patchPosFlat = patchPosGrid.reshaped([1, -1, dim])
-        return concatenated([classPos, patchPosFlat], axis: 1)
+        // python: `.to(previous_dtype)`. The resample runs in float32; without the cast,
+        // `tokens + pe` promotes the whole backbone to float32 (≈ 3× slower in fp16 runs).
+        return concatenated([classPos, patchPosFlat], axis: 1).asType(x.dtype)
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
