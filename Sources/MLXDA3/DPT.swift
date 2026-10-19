@@ -51,8 +51,10 @@ func positionGridToEmbed(posGrid: MLXArray, embedDim: Int) -> MLXArray {
     return emb.reshaped([H, W, embedDim])
 }
 
-/// Add UV positional embedding to feature map (NHWC).
-func addPosEmbed(_ x: MLXArray, wImg: Int, hImg: Int, ratio: Float = 0.1) -> MLXArray {
+/// Add DA3's UV sincos positional embedding (scaled by `ratio`) to an NHWC feature map.
+///
+/// `wImg` / `hImg` give the aspect ratio of the source image, not of `x`.
+public func addPosEmbed(_ x: MLXArray, wImg: Int, hImg: Int, ratio: Float = 0.1) -> MLXArray {
     let ph = x.dim(1)
     let pw = x.dim(2)
     let C = x.dim(3)
@@ -78,8 +80,8 @@ func addPosEmbed(_ x: MLXArray, wImg: Int, hImg: Int, ratio: Float = 0.1) -> MLX
 
 // MARK: - Bilinear Interpolation
 
-/// Bilinear interpolation for NHWC tensors.
-func bilinearInterpolate(_ x: MLXArray, size: (Int, Int)) -> MLXArray {
+/// Bilinear resize of an NHWC tensor to `size` (H, W), with `align_corners=True`.
+public func bilinearInterpolate(_ x: MLXArray, size: (Int, Int)) -> MLXArray {
     let (tH, tW) = size
     if x.dim(1) == tH && x.dim(2) == tW { return x }
     let upsample = Upsample(

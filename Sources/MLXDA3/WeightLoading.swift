@@ -23,10 +23,25 @@ private func splitFirst(_ s: String, separator: Character = ".") -> (String, Str
 
 /// Map a PyTorch weight key to the corresponding MLX model key.
 /// Returns nil for keys that should be skipped.
-func remapKey(_ key: String) -> String? {
+func remapKey(_ key: String, includeCameraModules: Bool = false) -> String? {
     // Strip "model." prefix
     guard key.hasPrefix("model.") else { return nil }
-    var rest = String(key.dropFirst("model.".count))
+    return remapDA3NetKey(String(key.dropFirst("model.".count)), includeCameraModules: includeCameraModules)
+}
+
+/// Map a `DepthAnything3Net`-relative PyTorch key (e.g. `backbone.pretrained.blocks.0.attn.qkv.weight`)
+/// to the corresponding key in a ``DepthAnything3`` module tree.
+///
+/// Use this to load DA3 networks embedded in a larger checkpoint: strip the outer prefix,
+/// remap, then convert the tensor with ``convertDA3Weight(key:_:)``.
+///
+/// - Parameters:
+///   - key: Net-relative PyTorch key.
+///   - includeCameraModules: Map `cam_enc.*` / `cam_dec.*` onto ``CameraEncoder`` /
+///     ``CameraDecoder`` instead of skipping them.
+/// - Returns: The MLX key, or `nil` when the tensor has no counterpart in the port.
+public func remapDA3NetKey(_ key: String, includeCameraModules: Bool = false) -> String? {
+    var rest = key
 
     // Nested checkpoints (e.g. da3nested-giant-large) wrap weights as
     // `model.da3.<...>` (anyview / multi-view branch) and `model.da3_metric.<...>`
@@ -38,9 +53,18 @@ func remapKey(_ key: String) -> String? {
         return nil
     }
 
-    // Skip camera encoder/decoder + GS head (not ported)
-    if rest.hasPrefix("cam_enc.") || rest.hasPrefix("cam_dec.") {
-        return nil
+    // Camera encoder/decoder: opt-in (most callers only need depth / rays).
+    if rest.hasPrefix("cam_enc.") {
+        return includeCameraModules ? rest : nil
+    }
+    if rest.hasPrefix("cam_dec.") {
+        guard includeCameraModules else { return nil }
+        // backbone = Sequential(Linear, ReLU, Linear, ReLU); fc_fov = Sequential(Linear, ReLU)
+        let decRest = String(rest.dropFirst("cam_dec.".count))
+        if decRest.hasPrefix("backbone.0.") { return "cam_dec.backbone.0." + decRest.dropFirst("backbone.0.".count) }
+        if decRest.hasPrefix("backbone.2.") { return "cam_dec.backbone.1." + decRest.dropFirst("backbone.2.".count) }
+        if decRest.hasPrefix("fc_fov.0.") { return "cam_dec.fc_fov." + decRest.dropFirst("fc_fov.0.".count) }
+        return rest
     }
     if rest.hasPrefix("gs_head.") || rest.hasPrefix("gs_adapter.") {
         return nil
@@ -160,6 +184,13 @@ func transposeConvTranspose2d(_ value: MLXArray) -> MLXArray {
     value.transposed(axes: [1, 2, 3, 0])
 }
 
+/// Convert a PyTorch tensor to the MLX layout expected at `key` (an MLX key from
+/// ``remapDA3NetKey(_:includeCameraModules:)``): NCHW conv kernels become NHWC.
+public func convertDA3Weight(key: String, _ value: MLXArray) -> MLXArray {
+    guard isConvWeight(key: key, shape: value.shape) else { return value }
+    return isConvTranspose(key: key) ? transposeConvTranspose2d(value) : transposeConv2d(value)
+}
+
 // MARK: - Public API
 
 /// Load PyTorch DA3 safetensors weights into an MLX model.
@@ -179,22 +210,14 @@ public func loadWeights(
     var remapped: [(String, MLXArray)] = []
     var skippedCount = 0
 
+    let includeCameraModules = model.cameraEncoder != nil || model.cameraDecoder != nil
     for (key, value) in weights {
-        guard let newKey = remapKey(key) else {
+        guard let newKey = remapKey(key, includeCameraModules: includeCameraModules) else {
             skippedCount += 1
             continue
         }
 
-        var v = value
-
-        // Conv weight transposition
-        if isConvWeight(key: newKey, shape: v.shape) {
-            if isConvTranspose(key: newKey) {
-                v = transposeConvTranspose2d(v)
-            } else {
-                v = transposeConv2d(v)
-            }
-        }
+        var v = convertDA3Weight(key: newKey, value)
 
         // Cast to target dtype
         if v.dtype == .float32 || v.dtype == .bfloat16 {

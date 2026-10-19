@@ -21,26 +21,39 @@ public struct DA3Outputs: OptionSet, Sendable {
 
 /// Depth Anything 3 — depth estimation from single or multi-view images.
 ///
-/// Combines a DinoV2 backbone with a DPT/DualDPT decoder head.
-/// For inference-only; does not include camera encoder/decoder or GS heads.
+/// Combines a DinoV2 backbone with a DPT/DualDPT decoder head, plus the optional
+/// camera encoder / decoder. For inference only; does not include the GS heads.
 public class DepthAnything3: Module {
     public static let patchSize = 14
 
     @ModuleInfo(key: "backbone") public var backbone: DinoVisionTransformer
     @ModuleInfo(key: "head") private var head: Module
+    /// Camera encoder (python `cam_enc`); `nil` unless built with camera modules.
+    @ModuleInfo(key: "cam_enc") public var cameraEncoder: CameraEncoder?
+    /// Camera decoder (python `cam_dec`); `nil` unless built with camera modules.
+    @ModuleInfo(key: "cam_dec") public var cameraDecoder: CameraDecoder?
 
     private let headType: String
 
-    public init(backbone: DinoVisionTransformer, head: DPT) {
+    /// The DualDPT head, when the model has one.
+    public var dualDPTHead: DualDPT? { head as? DualDPT }
+
+    public init(backbone: DinoVisionTransformer, head: DPT,
+                cameraEncoder: CameraEncoder? = nil, cameraDecoder: CameraDecoder? = nil) {
         self.headType = "dpt"
         self._backbone.wrappedValue = backbone
         self._head.wrappedValue = head
+        self._cameraEncoder.wrappedValue = cameraEncoder
+        self._cameraDecoder.wrappedValue = cameraDecoder
     }
 
-    public init(backbone: DinoVisionTransformer, head: DualDPT) {
+    public init(backbone: DinoVisionTransformer, head: DualDPT,
+                cameraEncoder: CameraEncoder? = nil, cameraDecoder: CameraDecoder? = nil) {
         self.headType = "dualdpt"
         self._backbone.wrappedValue = backbone
         self._head.wrappedValue = head
+        self._cameraEncoder.wrappedValue = cameraEncoder
+        self._cameraDecoder.wrappedValue = cameraDecoder
     }
 
     /// Forward pass.
@@ -107,11 +120,17 @@ public class DepthAnything3: Module {
 
 /// Build a DepthAnything3 model from a config name.
 ///
-/// - Parameter configName: One of "da3-small", "da3-base", "da3-large", "da3-giant", "da3mono-large"
+/// - Parameters:
+///   - configName: One of "da3-small", "da3-base", "da3-large", "da3-giant", "da3mono-large"
+///   - includeCameraModules: Also build ``CameraEncoder`` / ``CameraDecoder`` (multi-view
+///     configs only); ``loadWeights(model:url:dtype:)`` then loads `cam_enc` / `cam_dec`.
 /// - Returns: Uninitialized model (use `loadModel` for weights)
-public func buildModel(configName: String) -> DepthAnything3 {
+public func buildModel(configName: String, includeCameraModules: Bool = false) -> DepthAnything3 {
     let cfg = DA3Config.fromName(configName)
     let bb = cfg.backbone
+    let withCameras = includeCameraModules && cfg.altStart != -1
+    let cameraEncoder = withCameras ? CameraEncoder(dimOut: bb.embedDim) : nil
+    let cameraDecoder = withCameras ? CameraDecoder(dimIn: cfg.catToken ? 2 * bb.embedDim : bb.embedDim) : nil
 
     let backbone = DinoVisionTransformer(
         imgSize: 518,
@@ -144,7 +163,8 @@ public func buildModel(configName: String) -> DepthAnything3 {
             outChannels: hc.outChannels,
             posEmbed: hc.posEmbed
         )
-        return DepthAnything3(backbone: backbone, head: head)
+        return DepthAnything3(backbone: backbone, head: head,
+                              cameraEncoder: cameraEncoder, cameraDecoder: cameraDecoder)
     } else {
         let head = DPT(
             dimIn: hc.dimIn,
@@ -156,6 +176,7 @@ public func buildModel(configName: String) -> DepthAnything3 {
             useSkyHead: hc.useSkyHead,
             normType: hc.normType
         )
-        return DepthAnything3(backbone: backbone, head: head)
+        return DepthAnything3(backbone: backbone, head: head,
+                              cameraEncoder: cameraEncoder, cameraDecoder: cameraDecoder)
     }
 }
